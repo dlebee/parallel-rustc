@@ -19,7 +19,7 @@ pub struct Metadata {
     pub workspace_root: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Package {
     pub id: String,
     pub name: String,

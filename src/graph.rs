@@ -103,3 +103,28 @@ pub fn phases(dag: &Dag) -> Result<Vec<Vec<NodeIndex>>, String> {
     }
     Ok(phases)
 }
+
+/// Convenience: build the graph and compute phases in one shot, returning
+/// the phases as `Vec<Vec<Package>>` (package info, not node indices).
+/// Used primarily by integration tests.
+pub fn build_phases(meta: &Metadata) -> Vec<Vec<crate::metadata::Package>> {
+    let dag = build(meta).expect("graph build failed");
+    let ph = phases(&dag).expect("phase computation failed");
+    ph.iter()
+        .map(|phase_nodes| {
+            let mut pkgs: Vec<crate::metadata::Package> = phase_nodes
+                .iter()
+                .map(|&idx| {
+                    let id = dag.id_of(idx);
+                    meta.packages
+                        .iter()
+                        .find(|p| p.id == id)
+                        .cloned()
+                        .expect("package not found for id")
+                })
+                .collect();
+            pkgs.sort_by(|a, b| a.name.cmp(&b.name));
+            pkgs
+        })
+        .collect()
+}
