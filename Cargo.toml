@@ -1,0 +1,12 @@
+[package]
+name = "parallel-rustc"
+version = "0.0.0"
+edition = "2021"
+description = "Wavefront parallel compilation planner for Cargo workspaces"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+petgraph = "0.6"
