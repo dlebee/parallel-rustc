@@ -1,6 +1,6 @@
 # parallel-rustc
 
-> ⚠️ **Proof of concept / experiment** — not production-ready.
+> ⚠️ **Proof of concept / experiment** — not production-ready. **Use at your own risk.**
 
 A dependency-graph-aware parallel compilation planner for Rust workspaces.
 
