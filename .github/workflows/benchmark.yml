@@ -55,11 +55,11 @@ jobs:
             --manifest-path ${{ inputs.manifest_path }} \
             2>&1
 
-          START=$SECONDS
+          START=$(date +%s)
           RUSTFLAGS="--remap-path-prefix=$(pwd)=. --remap-path-prefix=$HOME=~" \
             cargo build --release -j1 \
             --manifest-path ${{ inputs.manifest_path }} 2>&1
-          echo "SERIAL_S=$((SECONDS - START))" >> serial-timing.txt
+          echo "SERIAL_S=$(( $(date +%s) - START ))" >> serial-timing.txt
 
           # Emit ASM for all workspace crates
           RUSTFLAGS="--remap-path-prefix=$(pwd)=. --remap-path-prefix=$HOME=~ --emit=asm" \
@@ -113,11 +113,11 @@ jobs:
           CPUS=$(nproc)
           echo "CPUS=${CPUS}" >> parallel-timing.txt
 
-          START=$SECONDS
+          START=$(date +%s)
           RUSTFLAGS="--remap-path-prefix=$(pwd)=. --remap-path-prefix=$HOME=~" \
             cargo build --release \
             --manifest-path ${{ inputs.manifest_path }} 2>&1
-          echo "PARALLEL_S=$((SECONDS - START))" >> parallel-timing.txt
+          echo "PARALLEL_S=$(( $(date +%s) - START ))" >> parallel-timing.txt
 
           # Emit ASM
           RUSTFLAGS="--remap-path-prefix=$(pwd)=. --remap-path-prefix=$HOME=~ --emit=asm" \
@@ -260,7 +260,7 @@ jobs:
           DIFF_DETAILS=""
 
           # Files in serial but not parallel
-          for f in "$SERIAL_DIR"/*.s 2>/dev/null; do
+          for f in $(ls "$SERIAL_DIR"/*.s 2>/dev/null); do
             [ -f "$f" ] || continue
             base=$(basename "$f")
             if [ ! -f "$PARALLEL_DIR/$base" ]; then
@@ -283,7 +283,7 @@ jobs:
           done
 
           # Files in parallel but not serial
-          for f in "$PARALLEL_DIR"/*.s 2>/dev/null; do
+          for f in $(ls "$PARALLEL_DIR"/*.s 2>/dev/null); do
             [ -f "$f" ] || continue
             base=$(basename "$f")
             if [ ! -f "$SERIAL_DIR/$base" ]; then
