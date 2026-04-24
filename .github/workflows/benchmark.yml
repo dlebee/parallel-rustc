@@ -339,8 +339,35 @@ jobs:
 
           ## 🔬 Assembly Equivalence
 
-          > Verifies that serial and parallel builds produce identical machine code.
-          > Strips path noise with \`--remap-path-prefix\`. Ignores blank lines and ASM comments.
+          ### Why compare assembly?
+
+          When compiling the same Rust source with the same flags and the same rustc version, the
+          output assembly should be **deterministic and identical** regardless of whether the build
+          was serial or parallel. If the two builds produce different assembly it means:
+
+          - 🔴 **Wrong build graph** — a crate compiled in the wrong order or with the wrong feature flags
+          - 🟡 **Non-determinism** — hash map iteration order or similar leaking into codegen
+          - 🟡 **Build script divergence** — a `build.rs` generated different output based on ambient state
+
+          So **identical ASM = the parallel phase ordering is semantically equivalent to serial**,
+          producing the exact same machine code. That is a strong correctness guarantee.
+
+          ### Limitations of this comparison
+
+          > ⚠️ This is a **smoke test, not a proof**. Both builds run on *separate* GitHub-hosted
+          > runners, so LLVM-internal hash seeds and codegen-unit ordering may cause benign
+          > differences even for perfectly correct code. A single-machine two-pass comparison
+          > against `.rlib` fingerprints would be more rigorous. Treat divergence as a signal
+          > to investigate, not a definitive failure.
+
+          ### How it works
+
+          1. Both builds emit assembly with `--emit=asm`
+          2. Paths are stripped with `--remap-path-prefix` so different runner home dirs don't pollute the diff
+          3. Hash suffixes are removed from `.s` filenames (`lib_name-HASH.s` → `lib_name.s`) for stable matching
+          4. Each file pair is diffed ignoring blank lines and ASM comment lines (`;...`)
+
+          ### Result
 
           **Verdict: ${{ env.ASM_VERDICT }}**
 
