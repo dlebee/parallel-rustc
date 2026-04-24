@@ -3,6 +3,23 @@
 //! Spawns `cargo build -p <name>` concurrently for every crate in a phase,
 //! waits for the phase to finish, then moves to the next. Wall-clock time
 //! is tracked per phase and in total.
+//!
+//! # Known Limitations (v0.1.0)
+//!
+//! ## Cargo file lock
+//! Each `cargo build -p <crate>` acquires an exclusive lock on `target/`.
+//! Concurrent invocations will serialize at the lock, reducing parallelism.
+//! **v0.2.0 fix**: invoke `rustc` directly via `--unit-graph -Z unstable-options`
+//! (nightly) or drive rustc invocations from cargo's `--build-plan` output.
+//!
+//! ## Feature flags
+//! `cargo build -p <crate>` resolves features from the full workspace context,
+//! so feature unification is correct. However, if a crate is built standalone
+//! before its dependents have activated all features, it may be compiled with
+//! fewer features than needed and Cargo will recompile it later.
+//! This is benign (correct final result) but wastes time.
+//! **v0.2.0 fix**: pass `--features <unified-set>` explicitly per crate,
+//! derived from `cargo metadata` resolve nodes.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;

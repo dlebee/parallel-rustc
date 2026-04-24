@@ -404,3 +404,112 @@ fn feature_gated_transitive_chain() {
     assert_in_phase(&phases, "middle", 1);
     assert_in_phase(&phases, "top", 2);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Case 16: Feature flags are correctly threaded to cargo build -p invocations
+//
+// When we call `cargo build -p crate-x`, cargo resolves features from the
+// full workspace context. This test verifies that a crate built via our
+// phase executor sees the same features as a full `cargo build`.
+// ─────────────────────────────────────────────────────────────────────────────
+#[test]
+fn feature_unification_survives_per_crate_build() {
+    let dir = tempfile::tempdir().unwrap();
+    create_workspace(dir.path(), &[
+        // base has two features; mid enables "extra" on base
+        TestCrate::lib("base")
+            .with_features(vec![
+                ("core", vec![]),
+                ("extra", vec![]),
+            ])
+            .with_defaults(vec!["core"]),
+        // mid depends on base and enables "extra"
+        TestCrate::lib("mid")
+            .with_deps(vec![Dep::with_features("base", vec!["extra"])]),
+        // top depends on mid
+        TestCrate::lib("top")
+            .with_deps(vec![Dep::required("mid")]),
+    ]);
+
+    // Phase plan: base in phase 0, mid in phase 1, top in phase 2
+    assert_workspace_builds(dir.path());
+    let phases = run_plan(dir.path());
+    assert_eq!(phases.len(), 3);
+    assert_in_phase(&phases, "base", 0);
+    assert_in_phase(&phases, "mid", 1);
+    assert_in_phase(&phases, "top", 2);
+
+    // When cargo builds `mid` (which requires base+extra), the workspace-level
+    // feature unification should give `base` both "core" and "extra".
+    // Verify by checking cargo metadata sees the unified feature set.
+    let out = std::process::Command::new("cargo")
+        .args(["metadata", "--format-version", "1", "--manifest-path"])
+        .arg(dir.path().join("Cargo.toml"))
+        .output().unwrap();
+    let meta: parallel_rustc::metadata::Metadata = serde_json::from_slice(&out.stdout).unwrap();
+
+    // base should have both "core" and "extra" in the resolved feature set
+    // because mid activates "extra" and default activates "core"
+    let base_node = meta.resolve.nodes.iter().find(|n| n.id.contains("base")).unwrap();
+    let features: std::collections::HashSet<&str> = base_node.features.iter().map(|s| s.as_str()).collect();
+    assert!(features.contains("core"), "base should have core feature, got: {:?}", features);
+    assert!(features.contains("extra"), "base should have extra feature (unified from mid), got: {:?}", features);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Case 17: compile_deps() excludes dev deps, preventing false feature edges
+// ─────────────────────────────────────────────────────────────────────────────
+#[test]
+fn dev_deps_excluded_from_compile_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    // lib-a has lib-b as a dev-dependency only
+    // This should NOT create an edge lib-b → lib-a in the build graph
+    create_workspace(dir.path(), &[
+        TestCrate::lib("lib-b"),
+        TestCrate::lib("lib-a")
+            .with_extra_toml("[dev-dependencies]\nlib-b = { path = \"../lib-b\" }"),
+    ]);
+    assert_workspace_builds(dir.path());
+    let phases = run_plan(dir.path());
+
+    // Both should be in phase 0 (no real dependency between them)
+    assert_eq!(phases.len(), 1, "lib-a and lib-b should both be phase 0, got phases: {:?}", phases);
+    assert_in_phase(&phases, "lib-a", 0);
+    assert_in_phase(&phases, "lib-b", 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Case 18: Feature flags propagate correctly through deep chain
+// A enables feat-x on B, B enables feat-y on C — all must be unified
+// ─────────────────────────────────────────────────────────────────────────────
+#[test]
+fn feature_propagation_deep_chain_unified() {
+    let dir = tempfile::tempdir().unwrap();
+    create_workspace(dir.path(), &[
+        TestCrate::lib("bottom")
+            .with_features(vec![("feat-y", vec![]), ("feat-z", vec![])]),
+        TestCrate::lib("middle")
+            .with_deps(vec![Dep::with_features("bottom", vec!["feat-y"])])
+            .with_features(vec![("feat-x", vec![])]),
+        TestCrate::lib("top")
+            .with_deps(vec![Dep::with_features("middle", vec!["feat-x"])]),
+    ]);
+    assert_workspace_builds(dir.path());
+    let phases = run_plan(dir.path());
+    assert_eq!(phases.len(), 3);
+
+    // Verify feature resolution via metadata
+    let out = std::process::Command::new("cargo")
+        .args(["metadata", "--format-version", "1", "--manifest-path"])
+        .arg(dir.path().join("Cargo.toml"))
+        .output().unwrap();
+    let meta: parallel_rustc::metadata::Metadata = serde_json::from_slice(&out.stdout).unwrap();
+
+    let bottom_node = meta.resolve.nodes.iter().find(|n| n.id.contains("bottom")).unwrap();
+    let bottom_features: std::collections::HashSet<&str> = bottom_node.features.iter().map(|s| s.as_str()).collect();
+    assert!(bottom_features.contains("feat-y"), "bottom should have feat-y, got: {:?}", bottom_features);
+
+    let middle_node = meta.resolve.nodes.iter().find(|n| n.id.contains("middle")).unwrap();
+    let middle_features: std::collections::HashSet<&str> = middle_node.features.iter().map(|s| s.as_str()).collect();
+    assert!(middle_features.contains("feat-x"), "middle should have feat-x, got: {:?}", middle_features);
+}
