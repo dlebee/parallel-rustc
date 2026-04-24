@@ -118,6 +118,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: parallel-rustc
+          ref: ${{ github.ref }}
 
       - name: Build parallel-rustc
         run: cd parallel-rustc && cargo build --release
