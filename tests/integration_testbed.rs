@@ -85,6 +85,13 @@ fn build_against_testbed() {
         return;
     };
     let manifest_str = manifest.to_string_lossy().into_owned();
+
+    // v2 needs a cold build — clean so cargo actually records rustc invocations.
+    // Without this, if the testbed is already built, cargo records nothing and
+    // the replay fails with "no rustc invocations recorded".
+    let ws = manifest.parent().unwrap();
+    let _ = std::fs::remove_dir_all(ws.join("target"));
+    let _ = std::fs::remove_dir_all(ws.join("target-v4"));
     let (ok, stdout, stderr) = run_bin(&["build", "--manifest-path", &manifest_str]);
     assert!(
         ok,
@@ -153,4 +160,51 @@ fn manifest_discovery_is_defensive() {
     // We might still find it via the sibling path; that's fine. We only care
     // that the lookup itself didn't panic on an invalid path.
     let _ = manifest.as_ref().map(|p| p.clone());
+}
+
+/// Ensure the testbed compiles cleanly via `parallel-rustc build-v4`.
+#[test]
+fn build_v4_against_testbed() {
+    let _g = testbed_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(manifest) = skip_if_no_testbed() else {
+        return;
+    };
+    let manifest_str = manifest.to_string_lossy().into_owned();
+
+    // Clean first so v4 sees a cold build.
+    let ws = manifest.parent().unwrap();
+    let _ = std::fs::remove_dir_all(ws.join("target"));
+    let _ = std::fs::remove_dir_all(ws.join("target-v4"));
+
+    let (ok, stdout, stderr) = run_bin(&["build-v4", "--manifest-path", &manifest_str]);
+    assert!(
+        ok,
+        "parallel-rustc build-v4 failed.\nstdout:\n{}\nstderr:\n{}",
+        stdout, stderr
+    );
+    // Header
+    assert!(
+        stdout.contains("parallel-rustc build (v4"),
+        "missing v4 header in output:\n{}",
+        stdout
+    );
+    // Final link summary
+    assert!(
+        stdout.contains("total:"),
+        "missing total timing in output:\n{}",
+        stdout
+    );
+    // At least 2 phases logged
+    let phase_lines = stdout.lines().filter(|l| l.trim().starts_with("phase ")).count();
+    assert!(
+        phase_lines >= 2,
+        "expected at least 2 phase log lines, got {phase_lines}:\n{stdout}"
+    );
+    // Binary must exist
+    let bin = ws.join("target").join("debug").join("app");
+    assert!(
+        bin.exists(),
+        "expected app binary at {} after build-v4",
+        bin.display()
+    );
 }

@@ -36,6 +36,10 @@ pub struct BuildConfig {
     /// If true, only build workspace members (external deps still built implicitly
     /// by cargo when it resolves a workspace member, but we don't try to drive them).
     pub workspace_only: bool,
+    /// If true (v4 batched mode), run one cargo invocation per phase with
+    /// multiple `-p` flags and cargo's internal `-j<jobs>` rustc parallelism,
+    /// instead of N parallel `cargo -p <pkg> -j1` invocations.
+    pub batched: bool,
 }
 
 // =============================================================================
