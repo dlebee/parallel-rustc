@@ -129,11 +129,13 @@ jobs:
           CARGO_TARGET_DIR: target-v4
           RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}/target-repo=. --emit=asm"
         run: |
-          WORKSPACE=$( [ "${{ inputs.build_workspace }}" = "true" ] && echo "--workspace" )
           CPUS=$(nproc)
           echo "=== parallel-rustc v4 batched (${CPUS} CPUs) ==="
           START=$(date +%s)
-          ../parallel-rustc/target/release/parallel-rustc build-v4             --manifest-path ${{ inputs.manifest_path }}             --jobs $CPUS             --batched             $WORKSPACE 2>&1
+          ../parallel-rustc/target/release/parallel-rustc build-v4 \
+            --manifest-path ${{ inputs.manifest_path }} \
+            --jobs $CPUS \
+            --batched 2>&1
           V4_S=$(( $(date +%s) - START ))
           echo "parallel-rustc v4 batched: ${V4_S}s"
           echo "V4_S=${V4_S}" >> ../timings.txt
