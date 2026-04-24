@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use parallel_rustc::builder::BuildConfig;
-use parallel_rustc::{bench, builder, graph, metadata, plan, unit_graph};
+use parallel_rustc::{bench, builder, builder_v4, graph, metadata, plan, unit_graph};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -51,7 +51,8 @@ enum Command {
     ///
     /// Default strategy is v0.2.0: record rustc invocations via
     /// `parallel-rustc-wrapper` and replay them in parallel phases. Pass
-    /// `--strategy v1` to use the older per-crate `cargo build -p` approach.
+    /// `--strategy v1` for per-crate `cargo build -p`, or `--strategy v4`
+    /// for the v0.4.0 unit-graph driven executor.
     Build {
         #[arg(long, value_name = "PATH")]
         manifest_path: Option<PathBuf>,
@@ -66,12 +67,30 @@ enum Command {
         #[arg(long, default_value_t = false)]
         workspace_only: bool,
 
-        /// Build strategy: "v2" (RUSTC_WRAPPER record/replay, default) or
-        /// "v1" (per-crate `cargo build -p`).
+        /// Build strategy: "v2" (RUSTC_WRAPPER record/replay, default),
+        /// "v1" (per-crate `cargo build -p`), or "v4" (unit-graph parallel).
         #[arg(long, default_value = "v2")]
         strategy: String,
     },
-    /// Cold-build the workspace three ways (serial, cargo -jN, parallel-rustc v2)
+    /// Build the workspace using the v0.4.0 unit-graph parallel executor.
+    ///
+    /// Drives `cargo build -p <pkg>` per unit-graph phase, each with its own
+    /// isolated `CARGO_TARGET_DIR` seeded via hardlinks from a shared
+    /// merged dir. No RUSTC_WRAPPER, no serial warmup. See spec/0.4.0.md.
+    BuildV4 {
+        #[arg(long, value_name = "PATH")]
+        manifest_path: Option<PathBuf>,
+
+        #[arg(long, default_value_t = false)]
+        release: bool,
+
+        #[arg(short = 'j', long, default_value_t = default_jobs())]
+        jobs: usize,
+
+        #[arg(long, default_value_t = false)]
+        workspace_only: bool,
+    },
+    /// Cold-build the workspace three ways (serial, cargo -jN, parallel-rustc v4)
     /// and print a comparison table.
     Bench {
         #[arg(long, value_name = "PATH")]
@@ -121,6 +140,15 @@ fn main() -> ExitCode {
                 };
                 run_build_cmd(&config, &strategy).await
             }
+            Command::BuildV4 { manifest_path, release, jobs, workspace_only } => {
+                let config = BuildConfig {
+                    manifest_path,
+                    release,
+                    jobs,
+                    workspace_only,
+                };
+                builder_v4::run_build_v4(&config).await.map(|_| ())
+            }
             Command::Bench { manifest_path, release, jobs, workspace_only } => {
                 let config = BuildConfig {
                     manifest_path,
@@ -162,7 +190,10 @@ async fn run_build_cmd(config: &BuildConfig, strategy: &str) -> Result<(), Strin
             let phases = graph::phases(&dag).map_err(|e| format!("phase computation: {e}"))?;
             builder::run_build(&meta, &dag, &phases, config).await.map(|_| ())
         }
-        other => Err(format!("unknown --strategy {other}; expected v1|v2")),
+        "v4" | "unit-graph" => {
+            builder_v4::run_build_v4(config).await.map(|_| ())
+        }
+        other => Err(format!("unknown --strategy {other}; expected v1|v2|v4")),
     }
 }
 
