@@ -88,3 +88,64 @@ See [`research/topics.md`](research/topics.md) for notes on feature unification,
 ## License
 
 [MIT](LICENSE)
+
+---
+
+## 🚀 Quick Start (Try It Locally)
+
+### 1. Install
+
+```bash
+# Clone and build
+git clone https://github.com/dlebee-agent/parallel-rustc
+cd parallel-rustc
+cargo install --path .
+```
+
+### 2. Run on your own project
+
+```bash
+# Show the full dependency phase plan
+parallel-rustc plan
+
+# Or point at a specific workspace
+parallel-rustc plan --manifest-path /path/to/your/project/Cargo.toml
+
+# Workspace members only (hides external deps)
+parallel-rustc plan --workspace-only
+```
+
+### 3. Example output
+
+```
+parallel-rustc plan
+workspace: /home/you/my-project
+packages: 34   phases: 9
+
+phase 0 (14 packages, parallel):
+  - cfg-if v1.0.0
+  - unicode-ident v1.0.12
+  - ...
+phase 1 (8 packages, parallel):
+  - proc-macro2 v1.0.86
+  - quote v1.0.37
+  - ...
+phase 8 (1 packages, parallel):
+  - my-project v0.1.0
+```
+
+### 4. What to look for
+
+- **phases** — minimum number of sequential compilation steps (the "depth" of your dep graph)
+- **Phase 0 width** — how many crates can compile in parallel immediately (wider = more initial parallelism)
+- **Theoretical max parallelism** = `total packages / phases` — how much speedup is possible with infinite CPUs
+
+### 5. Try it on a big project
+
+```bash
+git clone --depth 1 https://github.com/serde-rs/serde
+parallel-rustc plan --manifest-path serde/Cargo.toml
+
+git clone --depth 1 https://github.com/tokio-rs/tokio
+parallel-rustc plan --manifest-path tokio/Cargo.toml --workspace-only
+```
