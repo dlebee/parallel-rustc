@@ -12,6 +12,11 @@ on:
         required: false
         default: 'Cargo.toml'
         type: string
+      repo_branch:
+        description: 'Branch to checkout (default: repo default branch)'
+        required: false
+        default: ''
+        type: string
       rust_toolchain:
         description: 'Rust toolchain (default: stable)'
         required: false
@@ -29,7 +34,12 @@ jobs:
           toolchain: ${{ inputs.rust_toolchain }}
 
       - name: Clone target repo
-        run: git clone --depth 1 ${{ inputs.repo_url }} target-repo
+        run: |
+          if [ -n "${{ inputs.repo_branch }}" ]; then
+            git clone --depth 1 --branch ${{ inputs.repo_branch }} ${{ inputs.repo_url }} target-repo
+          else
+            git clone --depth 1 ${{ inputs.repo_url }} target-repo
+          fi
 
       - name: Build (serial, -j1)
         working-directory: target-repo
@@ -60,7 +70,12 @@ jobs:
           toolchain: ${{ inputs.rust_toolchain }}
 
       - name: Clone target repo
-        run: git clone --depth 1 ${{ inputs.repo_url }} target-repo
+        run: |
+          if [ -n "${{ inputs.repo_branch }}" ]; then
+            git clone --depth 1 --branch ${{ inputs.repo_branch }} ${{ inputs.repo_url }} target-repo
+          else
+            git clone --depth 1 ${{ inputs.repo_url }} target-repo
+          fi
 
       - name: Build (parallel, default -j)
         working-directory: target-repo
@@ -100,7 +115,12 @@ jobs:
         run: cargo build --release
 
       - name: Clone target repo
-        run: git clone --depth 1 ${{ inputs.repo_url }} target-repo
+        run: |
+          if [ -n "${{ inputs.repo_branch }}" ]; then
+            git clone --depth 1 --branch ${{ inputs.repo_branch }} ${{ inputs.repo_url }} target-repo
+          else
+            git clone --depth 1 ${{ inputs.repo_url }} target-repo
+          fi
 
       - name: Run parallel-rustc plan
         working-directory: target-repo
