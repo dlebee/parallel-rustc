@@ -29,6 +29,7 @@ pub async fn run_bench(
     _dag: &Dag,
     _phases: &[Vec<NodeIndex>],
     config: &BuildConfig,
+    with_batched: bool,
 ) -> Result<(), String> {
     println!("parallel-rustc bench");
     if !meta.workspace_root.is_empty() {
@@ -71,6 +72,26 @@ pub async fn run_bench(
         v4_vs_cargo
     );
 
+
+    // Mode 4 (optional): parallel-rustc v4 with --batched.
+    let (v4b, v4b_summary) = if with_batched {
+        println!("  [4/4] parallel-rustc v4 --batched (-j{}) ...", config.jobs);
+        clean_all(config.manifest_path.as_deref()).await?;
+        let cfg = BuildConfig { batched: true, ..config.clone() };
+        let v4b_started = Instant::now();
+        let summary = run_build_v4(&cfg).await?;
+        let elapsed = v4b_started.elapsed();
+        let r_s = ratio(serial, elapsed);
+        let r_c = ratio(cargo_par, elapsed);
+        println!(
+            "        {:>6.1}s  ({:.2}x vs serial, {:.2}x vs cargo)",
+            elapsed.as_secs_f64(), r_s, r_c
+        );
+        (Some(elapsed), Some(summary))
+    } else {
+        (None, None)
+    };
+
     println!();
     println!("Summary:");
     println!("  serial:            {:>5.1}s", serial.as_secs_f64());
@@ -86,6 +107,24 @@ pub async fn run_bench(
         v4_vs_serial,
         v4_vs_cargo
     );
+    if let Some(v4b_dur) = v4b {
+        println!(
+            "  v4 --batched:      {:>5.1}s  ({:.2}x vs serial, {:.2}x vs cargo, {:.2}x vs v4)",
+            v4b_dur.as_secs_f64(),
+            ratio(serial, v4b_dur),
+            ratio(cargo_par, v4b_dur),
+            ratio(v4, v4b_dur),
+        );
+        if let Some(s) = &v4b_summary {
+            println!(
+                "  v4b compile-only:  {:>5.1}s  ({:.2}x vs serial, {:.2}x vs cargo)",
+                s.compile.as_secs_f64(),
+                ratio(serial, s.compile),
+                ratio(cargo_par, s.compile),
+            );
+        }
+    }
+
     println!(
         "  v4 compile-only:   {:>5.1}s  ({:.2}x vs serial, {:.2}x vs cargo)",
         summary.compile.as_secs_f64(),

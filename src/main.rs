@@ -89,6 +89,12 @@ enum Command {
 
         #[arg(long, default_value_t = false)]
         workspace_only: bool,
+
+        /// Run one `cargo build -p A -p B ... -j<jobs>` per phase instead of
+        /// N parallel `cargo -p <pkg> -j1` invocations. Reduces per-phase
+        /// cargo process startup cost.
+        #[arg(long, default_value_t = false)]
+        batched: bool,
     },
     /// Cold-build the workspace three ways (serial, cargo -jN, parallel-rustc v4)
     /// and print a comparison table.
@@ -104,6 +110,11 @@ enum Command {
 
         #[arg(long, default_value_t = false)]
         workspace_only: bool,
+
+        /// Add a 4th mode to the comparison: v4 with `--batched` (one cargo
+        /// invocation per phase with multiple `-p` flags).
+        #[arg(long, default_value_t = false)]
+        with_batched: bool,
     },
 }
 
@@ -137,26 +148,29 @@ fn main() -> ExitCode {
                     release,
                     jobs,
                     workspace_only,
+                    batched: false,
                 };
                 run_build_cmd(&config, &strategy).await
             }
-            Command::BuildV4 { manifest_path, release, jobs, workspace_only } => {
+            Command::BuildV4 { manifest_path, release, jobs, workspace_only, batched } => {
                 let config = BuildConfig {
                     manifest_path,
                     release,
                     jobs,
                     workspace_only,
+                    batched,
                 };
                 builder_v4::run_build_v4(&config).await.map(|_| ())
             }
-            Command::Bench { manifest_path, release, jobs, workspace_only } => {
+            Command::Bench { manifest_path, release, jobs, workspace_only, with_batched } => {
                 let config = BuildConfig {
                     manifest_path,
                     release,
                     jobs,
                     workspace_only,
+                    batched: false,
                 };
-                run_bench_cmd(&config).await
+                run_bench_cmd(&config, with_batched).await
             }
         }
     });
@@ -197,11 +211,11 @@ async fn run_build_cmd(config: &BuildConfig, strategy: &str) -> Result<(), Strin
     }
 }
 
-async fn run_bench_cmd(config: &BuildConfig) -> Result<(), String> {
+async fn run_bench_cmd(config: &BuildConfig, with_batched: bool) -> Result<(), String> {
     let meta = metadata::load(config.manifest_path.as_deref()).map_err(|e| format!("cargo metadata: {e}"))?;
     let dag = graph::build(&meta).map_err(|e| format!("graph build: {e}"))?;
     let phases = graph::phases(&dag).map_err(|e| format!("phase computation: {e}"))?;
-    bench::run_bench(&meta, &dag, &phases, config).await
+    bench::run_bench(&meta, &dag, &phases, config, with_batched).await
 }
 
 fn run_plan_v2(
