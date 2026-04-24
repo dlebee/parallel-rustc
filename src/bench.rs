@@ -1,9 +1,10 @@
 //! Benchmark harness: run cold builds in three modes and print a comparison.
 //!
 //! Modes:
-//!   1. serial:         `cargo build -j1`
-//!   2. cargo parallel: `cargo build -jN`
-//!   3. parallel-rustc: phase-driven via [`crate::builder::run_build`]
+//!   1. serial:           `cargo build -j1`
+//!   2. cargo parallel:   `cargo build -jN`
+//!   3. parallel-rustc v2: RUSTC_WRAPPER record + parallel replay
+//!      (see [`crate::builder::run_build_v2`]).
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -12,15 +13,19 @@ use std::time::{Duration, Instant};
 use petgraph::graph::NodeIndex;
 use tokio::process::Command;
 
-use crate::builder::{run_build, BuildConfig};
+use crate::builder::{run_build_v2, BuildConfig};
 use crate::graph::Dag;
 use crate::metadata::Metadata;
 
-/// Run all three build modes sequentially and print a comparison table.
+/// Run three build modes sequentially and print a comparison table.
+///
+/// The `_dag` and `_phases` are accepted for API continuity with callers from
+/// v0.1.0 but are no longer used: v0.2.0 derives its own phase plan from
+/// recorded rustc invocations.
 pub async fn run_bench(
     meta: &Metadata,
-    dag: &Dag,
-    phases: &[Vec<NodeIndex>],
+    _dag: &Dag,
+    _phases: &[Vec<NodeIndex>],
     config: &BuildConfig,
 ) -> Result<(), String> {
     println!("parallel-rustc bench");
@@ -29,20 +34,17 @@ pub async fn run_bench(
     }
     let profile = if config.release { "release" } else { "debug" };
     println!();
-    println!(
-        "Running 3 build modes (cold builds, {})...",
-        profile
-    );
+    println!("Running 3 build modes (cold builds, {})...", profile);
     println!();
 
     // Mode 1: serial baseline.
-    println!("  [1/3] serial (-j1)         ...");
+    println!("  [1/3] serial (-j1)          ...");
     clean(config.manifest_path.as_deref()).await?;
     let serial = time_cargo_build(1, config).await?;
     println!("        {:>6.1}s", serial.as_secs_f64());
 
     // Mode 2: cargo's own parallelism at -jN.
-    println!("  [2/3] cargo parallel (-j{}) ...", config.jobs);
+    println!("  [2/3] cargo parallel (-j{})  ...", config.jobs);
     clean(config.manifest_path.as_deref()).await?;
     let cargo_par = time_cargo_build(config.jobs, config).await?;
     let sp_ratio = ratio(serial, cargo_par);
@@ -52,42 +54,48 @@ pub async fn run_bench(
         sp_ratio
     );
 
-    // Mode 3: our phase-driven executor.
-    println!("  [3/3] parallel-rustc (-j{}) ...", config.jobs);
+    // Mode 3: parallel-rustc v2 (wrapper-based replay).
+    println!("  [3/3] parallel-rustc v2 (-j{}) ...", config.jobs);
     clean(config.manifest_path.as_deref()).await?;
-    let prustc_started = Instant::now();
-    // Re-use run_build, but silence its own detailed output? For the bench we
-    // want the user to see progress too, so we let it print.
-    run_build(meta, dag, phases, config).await?;
-    let prustc = prustc_started.elapsed();
-    let pr_vs_serial = ratio(serial, prustc);
-    let pr_vs_cargo = ratio(cargo_par, prustc);
+    let v2_started = Instant::now();
+    let summary = run_build_v2(config).await?;
+    let v2 = v2_started.elapsed();
+    let v2_vs_serial = ratio(serial, v2);
+    let v2_vs_cargo = ratio(cargo_par, v2);
     println!(
         "        {:>6.1}s  ({:.2}× faster than serial, {:.2}× faster than cargo)",
-        prustc.as_secs_f64(),
-        pr_vs_serial,
-        pr_vs_cargo
+        v2.as_secs_f64(),
+        v2_vs_serial,
+        v2_vs_cargo
     );
-
-    let max_phase = phases.iter().map(|p| p.len()).max().unwrap_or(0);
 
     println!();
     println!("Summary:");
-    println!("  serial:          {:>5.1}s", serial.as_secs_f64());
+    println!("  serial:            {:>5.1}s", serial.as_secs_f64());
     println!(
-        "  cargo -j{}:       {:>5.1}s  ({:.2}×)",
+        "  cargo -j{}:         {:>5.1}s  ({:.2}×)",
         config.jobs,
         cargo_par.as_secs_f64(),
         sp_ratio
     );
     println!(
-        "  parallel-rustc:  {:>5.1}s  ({:.2}× vs serial, {:.2}× vs cargo)",
-        prustc.as_secs_f64(),
-        pr_vs_serial,
-        pr_vs_cargo
+        "  parallel-rustc v2: {:>5.1}s  ({:.2}× vs serial, {:.2}× vs cargo)",
+        v2.as_secs_f64(),
+        v2_vs_serial,
+        v2_vs_cargo
     );
-    println!("  phases used:     {:>5}", phases.len());
-    println!("  max phase width: {:>5}", max_phase);
+    println!("  v2 replay-only:    {:>5.1}s  ({:.2}× vs serial, {:.2}× vs cargo)",
+        summary.replay.as_secs_f64(),
+        ratio(serial, summary.replay),
+        ratio(cargo_par, summary.replay),
+    );
+    println!("  units compiled:    {:>5}", summary.units);
+    println!("  phases used:       {:>5}", summary.phases);
+    println!("  max phase width:   {:>5}", summary.max_phase_width);
+    println!();
+    println!("Note: v2 total includes a serial recording pass AND the parallel");
+    println!("      replay. For a fair apples-to-apples against cargo -jN, look");
+    println!("      at the \"replay-only\" timing printed above.");
 
     Ok(())
 }

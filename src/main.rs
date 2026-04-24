@@ -23,18 +23,18 @@ struct Cli {
 enum Command {
     /// Compute and print the parallel compilation plan (phases).
     Plan {
-        /// Path to Cargo.toml (workspace root or package).
         #[arg(long, value_name = "PATH")]
         manifest_path: Option<PathBuf>,
 
         /// Show only workspace members in the plan output, not external dependencies.
-        ///
-        /// The full dep graph is still used for phase computation — this only
-        /// filters what is printed. Useful for a quick human-readable summary.
         #[arg(long, default_value_t = false)]
         workspace_only: bool,
     },
     /// Build the workspace using phase-driven parallelism.
+    ///
+    /// Default strategy is v0.2.0: record rustc invocations via
+    /// `parallel-rustc-wrapper` and replay them in parallel phases. Pass
+    /// `--strategy v1` to use the older per-crate `cargo build -p` approach.
     Build {
         #[arg(long, value_name = "PATH")]
         manifest_path: Option<PathBuf>,
@@ -42,15 +42,20 @@ enum Command {
         #[arg(long, default_value_t = false)]
         release: bool,
 
-        /// Max parallel cargo processes per phase.
+        /// Max parallel processes per phase.
         #[arg(short = 'j', long, default_value_t = default_jobs())]
         jobs: usize,
 
         #[arg(long, default_value_t = false)]
         workspace_only: bool,
+
+        /// Build strategy: "v2" (RUSTC_WRAPPER record/replay, default) or
+        /// "v1" (per-crate `cargo build -p`).
+        #[arg(long, default_value = "v2")]
+        strategy: String,
     },
-    /// Cold-build the workspace three ways (serial, cargo -jN, parallel-rustc) and
-    /// print a comparison table.
+    /// Cold-build the workspace three ways (serial, cargo -jN, parallel-rustc v2)
+    /// and print a comparison table.
     Bench {
         #[arg(long, value_name = "PATH")]
         manifest_path: Option<PathBuf>,
@@ -87,14 +92,14 @@ fn main() -> ExitCode {
             Command::Plan { manifest_path, workspace_only } => {
                 run_plan(manifest_path.as_deref(), workspace_only)
             }
-            Command::Build { manifest_path, release, jobs, workspace_only } => {
+            Command::Build { manifest_path, release, jobs, workspace_only, strategy } => {
                 let config = BuildConfig {
                     manifest_path,
                     release,
                     jobs,
                     workspace_only,
                 };
-                run_build_cmd(&config).await
+                run_build_cmd(&config, &strategy).await
             }
             Command::Bench { manifest_path, release, jobs, workspace_only } => {
                 let config = BuildConfig {
@@ -125,11 +130,20 @@ fn run_plan(manifest_path: Option<&std::path::Path>, workspace_only: bool) -> Re
     Ok(())
 }
 
-async fn run_build_cmd(config: &BuildConfig) -> Result<(), String> {
-    let meta = metadata::load(config.manifest_path.as_deref()).map_err(|e| format!("cargo metadata: {e}"))?;
-    let dag = graph::build(&meta).map_err(|e| format!("graph build: {e}"))?;
-    let phases = graph::phases(&dag).map_err(|e| format!("phase computation: {e}"))?;
-    builder::run_build(&meta, &dag, &phases, config).await.map(|_| ())
+async fn run_build_cmd(config: &BuildConfig, strategy: &str) -> Result<(), String> {
+    match strategy {
+        "v2" | "wrapper" => {
+            builder::run_build_v2(config).await.map(|_| ())
+        }
+        "v1" | "cargo" => {
+            let meta = metadata::load(config.manifest_path.as_deref())
+                .map_err(|e| format!("cargo metadata: {e}"))?;
+            let dag = graph::build(&meta).map_err(|e| format!("graph build: {e}"))?;
+            let phases = graph::phases(&dag).map_err(|e| format!("phase computation: {e}"))?;
+            builder::run_build(&meta, &dag, &phases, config).await.map(|_| ())
+        }
+        other => Err(format!("unknown --strategy {other}; expected v1|v2")),
+    }
 }
 
 async fn run_bench_cmd(config: &BuildConfig) -> Result<(), String> {

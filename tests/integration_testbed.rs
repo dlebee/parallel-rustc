@@ -12,6 +12,17 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+
+
+// The testbed tests mutate a shared target/ directory, so serialize them with
+// a module-level mutex. Cargo runs tests in parallel threads by default, and
+// two concurrent builds would corrupt each other's artifacts.
+use std::sync::{Mutex, OnceLock};
+fn testbed_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn testbed_manifest() -> Option<PathBuf> {
     // Try a couple of plausible locations relative to this repo.
     let candidates = [
@@ -69,6 +80,7 @@ fn skip_if_no_testbed() -> Option<PathBuf> {
 /// Ensure the testbed compiles cleanly via `parallel-rustc build`.
 #[test]
 fn build_against_testbed() {
+    let _g = testbed_lock().lock().unwrap_or_else(|e| e.into_inner());
     let Some(manifest) = skip_if_no_testbed() else {
         return;
     };
@@ -100,6 +112,7 @@ fn build_against_testbed() {
 /// Ensure the bench subcommand runs all 3 modes and prints the comparison.
 #[test]
 fn bench_against_testbed() {
+    let _g = testbed_lock().lock().unwrap_or_else(|e| e.into_inner());
     let Some(manifest) = skip_if_no_testbed() else {
         return;
     };

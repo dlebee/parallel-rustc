@@ -1,6 +1,6 @@
 [package]
 name = "parallel-rustc"
-version = "0.0.0"
+version = "0.2.0"
 edition = "2021"
 description = "Wavefront parallel compilation planner for Cargo workspaces"
 license = "MIT OR Apache-2.0"
@@ -12,6 +12,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "parallel-rustc"
 path = "src/main.rs"
+
+[[bin]]
+name = "parallel-rustc-wrapper"
+path = "src/wrapper/main.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
