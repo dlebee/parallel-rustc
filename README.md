@@ -104,6 +104,8 @@ cargo install --path .
 
 ### 2. Run on your own project
 
+> **Note:** `plan` only **analyzes** — it does NOT invoke rustc or compile anything. Zero compilation. Just reads `Cargo.toml`/`Cargo.lock` and prints the phase plan.
+
 ```bash
 # Show the full dependency phase plan
 parallel-rustc plan
