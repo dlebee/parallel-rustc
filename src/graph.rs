@@ -38,7 +38,7 @@ pub fn build(meta: &Metadata) -> Result<Dag, String> {
     // Second pass: add dep -> dependent edges.
     for node in &meta.resolve.nodes {
         let dependent = by_id[&node.id];
-        for dep_id in &node.dependencies {
+        for dep_id in node.compile_deps() {
             let Some(&dep_idx) = by_id.get(dep_id) else {
                 // cargo should never emit a dangling id, but be defensive.
                 return Err(format!(

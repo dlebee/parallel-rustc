@@ -38,14 +38,62 @@ pub struct Resolve {
 #[allow(dead_code)]
 pub struct ResolveNode {
     pub id: String,
-    /// Package IDs this node depends on. `cargo metadata` also emits a
-    /// richer `deps` field (with dep_kinds), but `dependencies` is the
-    /// flat id list and is enough for v0 — we don't distinguish dev/build
-    /// edges yet (see research/topics.md).
+    /// Flat list of all dependency IDs (includes dev and build deps — use `deps` instead).
     #[serde(default)]
     pub dependencies: Vec<String>,
+    /// Rich dependency list with kind info. We use this to filter out dev-dependencies
+    /// which would otherwise create spurious edges (and cycles in packages like serde
+    /// that use themselves as a dev dep).
+    #[serde(default)]
+    pub deps: Vec<DepRef>,
     #[serde(default)]
     pub features: Vec<String>,
+}
+
+impl ResolveNode {
+    /// Returns only the normal (non-dev, non-build-script) compile dependency IDs.
+    /// Dev deps are excluded because they only apply to tests/benchmarks and including
+    /// them creates false edges (and cycles) in the build graph.
+    pub fn compile_deps(&self) -> Vec<&str> {
+        if self.deps.is_empty() {
+            // Fallback for old metadata format without `deps` field
+            return self.dependencies.iter().map(|s| s.as_str()).collect();
+        }
+        self.deps
+            .iter()
+            .filter(|d| {
+                // Keep only deps with at least one non-dev, non-build kind
+                d.dep_kinds.iter().any(|k| {
+                    k.kind.as_deref() != Some("dev")
+                })
+            })
+            .map(|d| d.pkg.as_str())
+            .collect()
+    }
+}
+
+/// A resolved dependency reference with kind information.
+#[derive(Debug, Deserialize)]
+pub struct DepRef {
+    /// Package ID of the dependency.
+    pub pkg: String,
+    /// Crate name as it appears in `extern crate`.
+    #[allow(dead_code)]
+    pub name: String,
+    /// Dependency kinds (normal, dev, build).
+    #[serde(default)]
+    pub dep_kinds: Vec<DepKind>,
+}
+
+/// A single dependency kind entry.
+#[derive(Debug, Deserialize)]
+pub struct DepKind {
+    /// `null` = normal, `"dev"` = dev dependency, `"build"` = build script dep.
+    pub kind: Option<String>,
+    /// Target platform filter, if any.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub target: Option<String>,
 }
 
 /// Run `cargo metadata --format-version 1` and parse its stdout.
