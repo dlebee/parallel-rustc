@@ -22,6 +22,11 @@ on:
         required: false
         default: 'stable'
         type: string
+      build_workspace:
+        description: 'Pass --workspace to build all crates (default: false)'
+        required: false
+        default: 'false'
+        type: string
 
 env:
   # Strip absolute paths from debug info so serial vs parallel ASM is comparable
