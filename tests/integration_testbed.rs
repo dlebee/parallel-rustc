@@ -145,6 +145,7 @@ fn bench_against_testbed() {
 /// the binary, just confirms our helper doesn't blow up on junk input).
 #[test]
 fn manifest_discovery_is_defensive() {
+    let _g = testbed_lock().lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var("PARALLEL_RUSTC_TESTBED", "/definitely/does/not/exist");
     // Clear after the call so other tests aren't affected.
     let manifest = testbed_manifest();
