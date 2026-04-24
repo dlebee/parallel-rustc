@@ -38,6 +38,33 @@ pub struct RustcUnit {
 }
 
 impl RustcUnit {
+    /// Returns true if this invocation is a build-probe (cfg-gated feature detection).
+    /// Probes output to a `probe` subdirectory inside the build script out dir.
+    /// They must not be replayed — Cargo already ran them and recorded the result.
+    pub fn is_probe(&self) -> bool {
+        // Probe invocations have an out-dir ending in /out/probe or /probe
+        // and their source is under a probe/ directory.
+        // We only skip when BOTH conditions are true to avoid false positives.
+        let out_is_probe = self.out_dir.contains("/out/probe")
+            || self.out_dir.contains("/probe/out")
+            || self.out_dir.ends_with("/probe");
+        let src_is_probe = self.src.contains("/probe/") || self.src.ends_with("/probe");
+        out_is_probe || src_is_probe
+    }
+
+    /// Returns true if this is a build-script compilation invocation.
+    /// Build scripts are compiled as executables named build_script_build.
+    /// They must not be replayed — Cargo already ran them in the record pass.
+    pub fn is_build_script(&self) -> bool {
+        self.crate_name == "build_script_build"
+            || self.crate_name.starts_with("build_script_")
+    }
+
+    /// Returns true if this unit should be skipped during replay.
+    pub fn should_skip_replay(&self) -> bool {
+        self.is_probe() || self.is_build_script()
+    }
+
     /// A short human label for logs.
     pub fn label(&self) -> String {
         if self.crate_name.is_empty() {
