@@ -8,9 +8,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-mod graph;
-mod metadata;
-mod plan;
+use parallel_rustc::{graph, metadata, plan};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -30,26 +28,35 @@ enum Command {
         /// Path to Cargo.toml (workspace root or package).
         #[arg(long, value_name = "PATH")]
         manifest_path: Option<PathBuf>,
+
+        /// Show only workspace members in the plan output, not external dependencies.
+        ///
+        /// The full dep graph is still used for phase computation — this only
+        /// filters what is printed. Useful for a quick human-readable summary.
+        #[arg(long, default_value_t = false)]
+        workspace_only: bool,
     },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Plan { manifest_path } => match run_plan(manifest_path.as_deref()) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("parallel-rustc: error: {e}");
-                ExitCode::FAILURE
+        Command::Plan { manifest_path, workspace_only } => {
+            match run_plan(manifest_path.as_deref(), workspace_only) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("parallel-rustc: error: {e}");
+                    ExitCode::FAILURE
+                }
             }
-        },
+        }
     }
 }
 
-fn run_plan(manifest_path: Option<&std::path::Path>) -> Result<(), String> {
+fn run_plan(manifest_path: Option<&std::path::Path>, workspace_only: bool) -> Result<(), String> {
     let meta = metadata::load(manifest_path).map_err(|e| format!("cargo metadata: {e}"))?;
     let dag = graph::build(&meta).map_err(|e| format!("graph build: {e}"))?;
     let phases = graph::phases(&dag).map_err(|e| format!("phase computation: {e}"))?;
-    plan::print(&meta, &dag, &phases);
+    plan::print(&meta, &dag, &phases, workspace_only);
     Ok(())
 }
