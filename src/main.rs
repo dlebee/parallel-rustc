@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use parallel_rustc::builder::BuildConfig;
-use parallel_rustc::{bench, builder, graph, metadata, plan};
+use parallel_rustc::{bench, builder, graph, metadata, plan, unit_graph};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -27,6 +27,23 @@ enum Command {
         manifest_path: Option<PathBuf>,
 
         /// Show only workspace members in the plan output, not external dependencies.
+        #[arg(long, default_value_t = false)]
+        workspace_only: bool,
+    },
+    /// Compute and print the plan from cargo's `--unit-graph` (v0.3.0, nightly).
+    ///
+    /// This uses `cargo +nightly build --unit-graph -Z unstable-options` to
+    /// get the exact compilation units and their dependencies — no inference
+    /// from `cargo metadata`. Phases here are more accurate because they
+    /// reflect cargo's own view of the build, including build-script runs
+    /// and resolved feature sets.
+    PlanV2 {
+        #[arg(long, value_name = "PATH")]
+        manifest_path: Option<PathBuf>,
+
+        #[arg(long, default_value_t = false)]
+        release: bool,
+
         #[arg(long, default_value_t = false)]
         workspace_only: bool,
     },
@@ -92,6 +109,9 @@ fn main() -> ExitCode {
             Command::Plan { manifest_path, workspace_only } => {
                 run_plan(manifest_path.as_deref(), workspace_only)
             }
+            Command::PlanV2 { manifest_path, release, workspace_only } => {
+                run_plan_v2(manifest_path.as_deref(), release, workspace_only)
+            }
             Command::Build { manifest_path, release, jobs, workspace_only, strategy } => {
                 let config = BuildConfig {
                     manifest_path,
@@ -151,4 +171,17 @@ async fn run_bench_cmd(config: &BuildConfig) -> Result<(), String> {
     let dag = graph::build(&meta).map_err(|e| format!("graph build: {e}"))?;
     let phases = graph::phases(&dag).map_err(|e| format!("phase computation: {e}"))?;
     bench::run_bench(&meta, &dag, &phases, config).await
+}
+
+fn run_plan_v2(
+    manifest_path: Option<&std::path::Path>,
+    release: bool,
+    workspace_only: bool,
+) -> Result<(), String> {
+    let units = unit_graph::fetch_unit_graph(manifest_path, release)
+        .map_err(|e| format!("fetch unit-graph: {e}"))?;
+    let phases =
+        unit_graph::assign_phases(&units).map_err(|e| format!("phase computation: {e}"))?;
+    unit_graph::print_plan(&units, &phases, workspace_only);
+    Ok(())
 }
