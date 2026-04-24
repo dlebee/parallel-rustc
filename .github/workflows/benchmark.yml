@@ -1,21 +1,21 @@
-name: Benchmark — Serial vs Parallel Plan
+name: Benchmark — Serial vs Parallel + Assembly Equivalence
 
 on:
   workflow_dispatch:
     inputs:
       repo_url:
-        description: 'Public GitHub repo URL (e.g. https://github.com/tokio-rs/tokio)'
+        description: 'Public GitHub repo URL (e.g. https://github.com/serde-rs/serde)'
         required: true
+        type: string
+      repo_branch:
+        description: 'Branch to checkout (leave blank for default branch)'
+        required: false
+        default: ''
         type: string
       manifest_path:
         description: 'Path to Cargo.toml relative to repo root (default: Cargo.toml)'
         required: false
         default: 'Cargo.toml'
-        type: string
-      repo_branch:
-        description: 'Branch to checkout (default: repo default branch)'
-        required: false
-        default: ''
         type: string
       rust_toolchain:
         description: 'Rust toolchain (default: stable)'
@@ -23,7 +23,13 @@ on:
         default: 'stable'
         type: string
 
+env:
+  # Strip absolute paths from debug info so serial vs parallel ASM is comparable
+  RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=."
+  CARGO_TERM_COLOR: always
+
 jobs:
+  # ── Job 1: Serial build ─────────────────────────────────────────────────────
   serial-build:
     name: Serial Build (-j1)
     runs-on: ubuntu-latest
@@ -41,25 +47,49 @@ jobs:
             git clone --depth 1 ${{ inputs.repo_url }} target-repo
           fi
 
-      - name: Build (serial, -j1)
+      - name: Build serial + emit ASM
         working-directory: target-repo
         run: |
-          echo "::group::cargo build -j1"
-          START=$(date +%s%N)
-          cargo build -j1 --manifest-path ${{ inputs.manifest_path }} 2>&1
-          END=$(date +%s%N)
-          ELAPSED_MS=$(( (END - START) / 1000000 ))
-          echo "::endgroup::"
-          echo "## Serial Build" >> $GITHUB_STEP_SUMMARY
-          echo "- **Time:** ${ELAPSED_MS}ms ($(( ELAPSED_MS / 1000 ))s)" >> $GITHUB_STEP_SUMMARY
-          echo "SERIAL_MS=${ELAPSED_MS}" >> serial-timing.txt
+          RUSTFLAGS="--remap-path-prefix=$(pwd)=. --remap-path-prefix=$HOME=~" \
+            cargo build --release -j1 \
+            --manifest-path ${{ inputs.manifest_path }} \
+            2>&1
 
-      - name: Upload timing
+          START=$SECONDS
+          RUSTFLAGS="--remap-path-prefix=$(pwd)=. --remap-path-prefix=$HOME=~" \
+            cargo build --release -j1 \
+            --manifest-path ${{ inputs.manifest_path }} 2>&1
+          echo "SERIAL_S=$((SECONDS - START))" >> serial-timing.txt
+
+          # Emit ASM for all workspace crates
+          RUSTFLAGS="--remap-path-prefix=$(pwd)=. --remap-path-prefix=$HOME=~ --emit=asm" \
+            cargo build --release -j1 \
+            --manifest-path ${{ inputs.manifest_path }} 2>&1 || true
+
+          # Collect .s files
+          mkdir -p serial-asm
+          find target/release/deps -name "*.s" | sort | while read f; do
+            base=$(basename "$f")
+            # Strip hash suffix for stable names: lib_name-HASH.s → lib_name.s
+            clean=$(echo "$base" | sed 's/-[a-f0-9]\{16\}\.s$/.s/')
+            cp "$f" "serial-asm/${clean}"
+          done
+          echo "ASM files: $(ls serial-asm | wc -l)"
+
+          SERIAL_S=$(cat serial-timing.txt | grep SERIAL_S | cut -d= -f2)
+          echo "## Serial Build" >> $GITHUB_STEP_SUMMARY
+          echo "- **Time:** ${SERIAL_S}s" >> $GITHUB_STEP_SUMMARY
+          echo "- **ASM files:** $(ls serial-asm | wc -l)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload serial artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: serial-timing
-          path: target-repo/serial-timing.txt
+          name: serial
+          path: |
+            target-repo/serial-timing.txt
+            target-repo/serial-asm/
 
+  # ── Job 2: Parallel build ────────────────────────────────────────────────────
   parallel-build:
     name: Parallel Build (default -j)
     runs-on: ubuntu-latest
@@ -77,28 +107,45 @@ jobs:
             git clone --depth 1 ${{ inputs.repo_url }} target-repo
           fi
 
-      - name: Build (parallel, default -j)
+      - name: Build parallel + emit ASM
         working-directory: target-repo
         run: |
           CPUS=$(nproc)
-          echo "::group::cargo build (${CPUS} CPUs)"
-          START=$(date +%s%N)
-          cargo build --manifest-path ${{ inputs.manifest_path }} 2>&1
-          END=$(date +%s%N)
-          ELAPSED_MS=$(( (END - START) / 1000000 ))
-          echo "::endgroup::"
-          echo "## Parallel Build" >> $GITHUB_STEP_SUMMARY
-          echo "- **Time:** ${ELAPSED_MS}ms ($(( ELAPSED_MS / 1000 ))s)" >> $GITHUB_STEP_SUMMARY
-          echo "- **CPUs:** ${CPUS}" >> $GITHUB_STEP_SUMMARY
-          echo "PARALLEL_MS=${ELAPSED_MS}" >> parallel-timing.txt
           echo "CPUS=${CPUS}" >> parallel-timing.txt
 
-      - name: Upload timing
+          START=$SECONDS
+          RUSTFLAGS="--remap-path-prefix=$(pwd)=. --remap-path-prefix=$HOME=~" \
+            cargo build --release \
+            --manifest-path ${{ inputs.manifest_path }} 2>&1
+          echo "PARALLEL_S=$((SECONDS - START))" >> parallel-timing.txt
+
+          # Emit ASM
+          RUSTFLAGS="--remap-path-prefix=$(pwd)=. --remap-path-prefix=$HOME=~ --emit=asm" \
+            cargo build --release \
+            --manifest-path ${{ inputs.manifest_path }} 2>&1 || true
+
+          mkdir -p parallel-asm
+          find target/release/deps -name "*.s" | sort | while read f; do
+            base=$(basename "$f")
+            clean=$(echo "$base" | sed 's/-[a-f0-9]\{16\}\.s$/.s/')
+            cp "$f" "parallel-asm/${clean}"
+          done
+          echo "ASM files: $(ls parallel-asm | wc -l)"
+
+          PARALLEL_S=$(grep PARALLEL_S parallel-timing.txt | cut -d= -f2)
+          echo "## Parallel Build" >> $GITHUB_STEP_SUMMARY
+          echo "- **Time:** ${PARALLEL_S}s (${CPUS} CPUs)" >> $GITHUB_STEP_SUMMARY
+          echo "- **ASM files:** $(ls parallel-asm | wc -l)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload parallel artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: parallel-timing
-          path: target-repo/parallel-timing.txt
+          name: parallel
+          path: |
+            target-repo/parallel-timing.txt
+            target-repo/parallel-asm/
 
+  # ── Job 3: Phase analysis ─────────────────────────────────────────────────
   phase-analysis:
     name: Phase Analysis (parallel-rustc plan)
     runs-on: ubuntu-latest
@@ -125,35 +172,34 @@ jobs:
       - name: Run parallel-rustc plan
         working-directory: target-repo
         run: |
-          echo "::group::parallel-rustc plan"
-          ../target/release/parallel-rustc plan --manifest-path ${{ inputs.manifest_path }} | tee plan-output.txt
-          echo "::endgroup::"
+          PLAN=$(../target/release/parallel-rustc plan --manifest-path ${{ inputs.manifest_path }} 2>&1)
+          echo "$PLAN"
+          echo "$PLAN" > plan-full.txt
 
-          PACKAGES=$(head -5 plan-output.txt | grep -o 'packages: [0-9]*' | grep -o '[0-9]*' || echo "0")
-          PHASES=$(head -5 plan-output.txt | grep -o 'phases: [0-9]*' | grep -o '[0-9]*' || echo "0")
+          PACKAGES=$(echo "$PLAN" | grep "^packages:" | grep -o 'packages: [0-9]*' | grep -o '[0-9]*' || echo "0")
+          PHASES=$(echo "$PLAN" | grep "^packages:" | grep -o 'phases: [0-9]*' | grep -o '[0-9]*' || echo "0")
           MAX_WIDTH=0
           while IFS= read -r line; do
             if echo "$line" | grep -q "^phase .* packages"; then
               W=$(echo "$line" | grep -o '[0-9]* packages' | grep -o '[0-9]*')
-              if [ "$W" -gt "$MAX_WIDTH" ] 2>/dev/null; then MAX_WIDTH=$W; fi
+              [ "${W:-0}" -gt "$MAX_WIDTH" ] && MAX_WIDTH=$W
             fi
-          done < plan-output.txt
+          done < plan-full.txt
 
-          echo "PACKAGES=${PACKAGES}" >> plan-stats.txt
-          echo "PHASES=${PHASES}" >> plan-stats.txt
-          echo "MAX_WIDTH=${MAX_WIDTH}" >> plan-stats.txt
-          cp plan-output.txt plan-full.txt
+          printf "PACKAGES=%s\nPHASES=%s\nMAX_WIDTH=%s\n" "$PACKAGES" "$PHASES" "$MAX_WIDTH" > plan-stats.txt
+          cat plan-stats.txt
 
       - name: Upload plan
         uses: actions/upload-artifact@v4
         with:
-          name: plan-output
+          name: plan
           path: |
             target-repo/plan-stats.txt
             target-repo/plan-full.txt
 
+  # ── Job 4: Compare timings + ASM equivalence ──────────────────────────────
   compare:
-    name: Compare Results
+    name: Compare & Verify Equivalence
     needs: [serial-build, parallel-build, phase-analysis]
     runs-on: ubuntu-latest
     steps:
@@ -162,72 +208,168 @@ jobs:
         with:
           path: artifacts
 
-      - name: Generate comparison report
-        run: |
-          SERIAL_MS=$(grep SERIAL_MS artifacts/serial-timing/serial-timing.txt | cut -d= -f2)
-          PARALLEL_MS=$(grep PARALLEL_MS artifacts/parallel-timing/parallel-timing.txt | cut -d= -f2)
-          CPUS=$(grep CPUS artifacts/parallel-timing/parallel-timing.txt | cut -d= -f2)
-          PACKAGES=$(grep PACKAGES artifacts/plan-output/plan-stats.txt | cut -d= -f2)
-          PHASES=$(grep PHASES artifacts/plan-output/plan-stats.txt | cut -d= -f2)
-          MAX_WIDTH=$(grep MAX_WIDTH artifacts/plan-output/plan-stats.txt | cut -d= -f2)
+      - name: Show artifact structure
+        run: find artifacts -type f | sort
 
-          if [ "$PARALLEL_MS" -gt 0 ] 2>/dev/null; then
-            SPEEDUP=$(echo "scale=2; $SERIAL_MS / $PARALLEL_MS" | bc 2>/dev/null || echo "?")
+      - name: Parse timings + plan stats
+        id: stats
+        run: |
+          SERIAL_S=$(grep SERIAL_S artifacts/serial/serial-timing.txt | cut -d= -f2 || echo "?")
+          PARALLEL_S=$(grep PARALLEL_S artifacts/parallel/parallel-timing.txt | cut -d= -f2 || echo "?")
+          CPUS=$(grep CPUS artifacts/parallel/parallel-timing.txt | cut -d= -f2 || echo "?")
+          PACKAGES=$(grep PACKAGES artifacts/plan/plan-stats.txt | cut -d= -f2 || echo "?")
+          PHASES=$(grep PHASES artifacts/plan/plan-stats.txt | cut -d= -f2 || echo "?")
+          MAX_WIDTH=$(grep MAX_WIDTH artifacts/plan/plan-stats.txt | cut -d= -f2 || echo "?")
+
+          if [ "$PARALLEL_S" != "?" ] && [ "$PARALLEL_S" -gt 0 ] 2>/dev/null; then
+            SPEEDUP=$(echo "scale=2; $SERIAL_S / $PARALLEL_S" | bc || echo "?")
           else
             SPEEDUP="?"
           fi
-          if [ "$PHASES" -gt 0 ] 2>/dev/null; then
-            THEORETICAL=$(echo "scale=2; $PACKAGES / $PHASES" | bc 2>/dev/null || echo "?")
+          if [ "$PHASES" != "?" ] && [ "$PHASES" -gt 0 ] 2>/dev/null; then
+            THEORETICAL=$(echo "scale=2; $PACKAGES / $PHASES" | bc || echo "?")
           else
             THEORETICAL="?"
           fi
 
-          SERIAL_S=$(echo "scale=1; $SERIAL_MS / 1000" | bc 2>/dev/null || echo "?")
-          PARALLEL_S=$(echo "scale=1; $PARALLEL_MS / 1000" | bc 2>/dev/null || echo "?")
+          echo "SERIAL_S=$SERIAL_S" >> $GITHUB_ENV
+          echo "PARALLEL_S=$PARALLEL_S" >> $GITHUB_ENV
+          echo "CPUS=$CPUS" >> $GITHUB_ENV
+          echo "PACKAGES=$PACKAGES" >> $GITHUB_ENV
+          echo "PHASES=$PHASES" >> $GITHUB_ENV
+          echo "MAX_WIDTH=$MAX_WIDTH" >> $GITHUB_ENV
+          echo "SPEEDUP=$SPEEDUP" >> $GITHUB_ENV
+          echo "THEORETICAL=$THEORETICAL" >> $GITHUB_ENV
+
+      - name: Compare ASM files
+        id: asm_compare
+        run: |
+          SERIAL_DIR=artifacts/serial/serial-asm
+          PARALLEL_DIR=artifacts/parallel/parallel-asm
+
+          SERIAL_COUNT=$(ls "$SERIAL_DIR" 2>/dev/null | wc -l)
+          PARALLEL_COUNT=$(ls "$PARALLEL_DIR" 2>/dev/null | wc -l)
+
+          echo "Serial ASM files: $SERIAL_COUNT"
+          echo "Parallel ASM files: $PARALLEL_COUNT"
+
+          IDENTICAL=0
+          DIFFERENT=0
+          ONLY_SERIAL=0
+          ONLY_PARALLEL=0
+          DIFF_DETAILS=""
+
+          # Files in serial but not parallel
+          for f in "$SERIAL_DIR"/*.s 2>/dev/null; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f")
+            if [ ! -f "$PARALLEL_DIR/$base" ]; then
+              ONLY_SERIAL=$((ONLY_SERIAL + 1))
+              DIFF_DETAILS="${DIFF_DETAILS}\n- Only in serial: \`$base\`"
+            else
+              # Compare (ignoring blank lines and comment-only lines which may vary)
+              if diff <(grep -v '^\s*$\|^\s*;' "$f") \
+                      <(grep -v '^\s*$\|^\s*;' "$PARALLEL_DIR/$base") \
+                      > /dev/null 2>&1; then
+                IDENTICAL=$((IDENTICAL + 1))
+              else
+                DIFFERENT=$((DIFFERENT + 1))
+                FIRST_DIFF=$(diff <(grep -v '^\s*$\|^\s*;' "$f") \
+                                  <(grep -v '^\s*$\|^\s*;' "$PARALLEL_DIR/$base") \
+                                  | head -10)
+                DIFF_DETAILS="${DIFF_DETAILS}\n- Different: \`$base\`\n\`\`\`diff\n${FIRST_DIFF}\n\`\`\`"
+              fi
+            fi
+          done
+
+          # Files in parallel but not serial
+          for f in "$PARALLEL_DIR"/*.s 2>/dev/null; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f")
+            if [ ! -f "$SERIAL_DIR/$base" ]; then
+              ONLY_PARALLEL=$((ONLY_PARALLEL + 1))
+              DIFF_DETAILS="${DIFF_DETAILS}\n- Only in parallel: \`$base\`"
+            fi
+          done
+
+          TOTAL_COMPARED=$((IDENTICAL + DIFFERENT))
+
+          echo "IDENTICAL=$IDENTICAL" >> $GITHUB_ENV
+          echo "DIFFERENT=$DIFFERENT" >> $GITHUB_ENV
+          echo "ONLY_SERIAL=$ONLY_SERIAL" >> $GITHUB_ENV
+          echo "ONLY_PARALLEL=$ONLY_PARALLEL" >> $GITHUB_ENV
+          echo "TOTAL_COMPARED=$TOTAL_COMPARED" >> $GITHUB_ENV
+          echo "SERIAL_COUNT=$SERIAL_COUNT" >> $GITHUB_ENV
+          echo "PARALLEL_COUNT=$PARALLEL_COUNT" >> $GITHUB_ENV
+
+          # Save diff details for report
+          printf "%b" "$DIFF_DETAILS" > diff-details.txt
+
+          if [ "$DIFFERENT" -eq 0 ] && [ "$ONLY_SERIAL" -eq 0 ] && [ "$ONLY_PARALLEL" -eq 0 ]; then
+            echo "ASM_VERDICT=✅ IDENTICAL" >> $GITHUB_ENV
+          else
+            echo "ASM_VERDICT=⚠️ DIFFERENCES FOUND" >> $GITHUB_ENV
+          fi
+
+      - name: Generate summary report
+        run: |
+          DIFF_CONTENT=$(cat diff-details.txt 2>/dev/null || echo "none")
+          PLAN_CONTENT=$(cat artifacts/plan/plan-full.txt 2>/dev/null || echo "plan unavailable")
 
           cat >> $GITHUB_STEP_SUMMARY << REPORT
           # 🏁 Benchmark Results
 
           **Target:** \`${{ inputs.repo_url }}\`
+          **Branch:** \`${{ inputs.repo_branch || 'default' }}\`
           **Manifest:** \`${{ inputs.manifest_path }}\`
           **Toolchain:** \`${{ inputs.rust_toolchain }}\`
-          **Runner CPUs:** ${CPUS}
+          **Runner CPUs:** ${{ env.CPUS }}
 
-          ## Timings
+          ---
 
-          | Build Mode | Time | Notes |
+          ## ⏱️ Build Timings
+
+          | Mode | Time | Notes |
           |---|---|---|
-          | Serial (\`-j1\`) | **${SERIAL_S}s** (${SERIAL_MS}ms) | Single-threaded baseline |
-          | Parallel (default) | **${PARALLEL_S}s** (${PARALLEL_MS}ms) | Cargo's built-in parallelism |
-          | **Actual speedup** | **${SPEEDUP}×** | parallel / serial |
+          | Serial (\`-j1\`) | **${{ env.SERIAL_S }}s** | Single-threaded baseline |
+          | Parallel (default) | **${{ env.PARALLEL_S }}s** | Cargo's built-in parallelism |
+          | **Actual speedup** | **${{ env.SPEEDUP }}×** | |
 
-          ## Phase Analysis (parallel-rustc)
+          ---
+
+          ## 🔬 Assembly Equivalence
+
+          > Verifies that serial and parallel builds produce identical machine code.
+          > Strips path noise with \`--remap-path-prefix\`. Ignores blank lines and ASM comments.
+
+          **Verdict: ${{ env.ASM_VERDICT }}**
+
+          | Metric | Count |
+          |---|---|
+          | Serial ASM files | ${{ env.SERIAL_COUNT }} |
+          | Parallel ASM files | ${{ env.PARALLEL_COUNT }} |
+          | Compared | ${{ env.TOTAL_COMPARED }} |
+          | ✅ Identical | ${{ env.IDENTICAL }} |
+          | ❌ Different | ${{ env.DIFFERENT }} |
+          | Only in serial | ${{ env.ONLY_SERIAL }} |
+          | Only in parallel | ${{ env.ONLY_PARALLEL }} |
+
+          $DIFF_CONTENT
+
+          ---
+
+          ## 📊 Phase Analysis (parallel-rustc)
 
           | Metric | Value |
           |---|---|
-          | Total packages | ${PACKAGES} |
-          | Phases (min serial depth) | ${PHASES} |
-          | Max phase width | ${MAX_WIDTH} |
-          | Theoretical max parallelism | ${THEORETICAL}× |
+          | Total packages | ${{ env.PACKAGES }} |
+          | Phases (min serial depth) | ${{ env.PHASES }} |
+          | Max phase width | ${{ env.MAX_WIDTH }} |
+          | Theoretical max parallelism | ${{ env.THEORETICAL }}× |
 
           ## Phase Plan
 
           \`\`\`
-          $(cat artifacts/plan-output/plan-full.txt)
+          $PLAN_CONTENT
           \`\`\`
-
-          ## Interpretation
-
-          - **Actual speedup** (${SPEEDUP}×) shows what Cargo achieves with built-in parallelism on ${CPUS} CPUs.
-          - **Theoretical max** (${THEORETICAL}×) is the upper bound assuming infinite CPUs and uniform crate compile times.
-          - Gap between actual and theoretical = room for smarter scheduling (e.g., .rmeta-based early starts, critical-path prioritization).
           REPORT
-
-      - name: Print summary to log
-        run: |
-          echo "=== Serial ==="
-          cat artifacts/serial-timing/serial-timing.txt
-          echo "=== Parallel ==="
-          cat artifacts/parallel-timing/parallel-timing.txt
-          echo "=== Plan ==="
-          cat artifacts/plan-output/plan-full.txt
