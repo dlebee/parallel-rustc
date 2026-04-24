@@ -28,6 +28,11 @@ on:
         required: false
         default: 'stable'
         type: string
+      build_workspace:
+        description: 'Pass --workspace to build all crates (default: false)'
+        required: false
+        default: 'false'
+        type: string
 
 jobs:
   equivalence:
@@ -61,7 +66,7 @@ jobs:
         run: |
           echo "=== Serial build (-j1) ==="
           START=$(date +%s)
-          cargo build --release -j1 --manifest-path ${{ inputs.manifest_path }} 2>&1
+          cargo build --release -j1 --manifest-path ${{ inputs.manifest_path }} $( [ "${{ inputs.build_workspace }}" = "true" ] && echo "--workspace" ) 2>&1
           SERIAL_S=$(( $(date +%s) - START ))
           echo "Serial time: ${SERIAL_S}s"
           echo "SERIAL_S=${SERIAL_S}" >> ../build-times.txt
@@ -75,7 +80,7 @@ jobs:
           echo "=== Parallel build ==="
           CPUS=$(nproc)
           START=$(date +%s)
-          cargo build --release --manifest-path ${{ inputs.manifest_path }} 2>&1
+          cargo build --release --manifest-path ${{ inputs.manifest_path }} $( [ "${{ inputs.build_workspace }}" = "true" ] && echo "--workspace" ) 2>&1
           PARALLEL_S=$(( $(date +%s) - START ))
           echo "Parallel time: ${PARALLEL_S}s (${CPUS} CPUs)"
           echo "PARALLEL_S=${PARALLEL_S}" >> ../build-times.txt
