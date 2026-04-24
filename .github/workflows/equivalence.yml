@@ -50,6 +50,11 @@ jobs:
       - name: Build parallel-rustc
         run: cargo build --release
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler libclang-dev cmake
+
       - name: Clone target repo
         run: |
           if [ -n "${{ inputs.repo_branch }}" ]; then
