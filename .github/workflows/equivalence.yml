@@ -127,7 +127,7 @@ jobs:
         working-directory: target-repo
         env:
           CARGO_TARGET_DIR: target-v4
-          RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}/target-repo=."
+          RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}/target-repo=. --emit=asm"
         run: |
           WORKSPACE=$( [ "${{ inputs.build_workspace }}" = "true" ] && echo "--workspace" )
           CPUS=$(nproc)
@@ -138,6 +138,14 @@ jobs:
           echo "parallel-rustc v4 batched: ${V4_S}s"
           echo "V4_S=${V4_S}" >> ../timings.txt
           echo "CPUS=${CPUS}" >> ../timings.txt
+
+          # Collect ASM from v4 build
+          mkdir -p ../asm-v4
+          find target-v4/release/deps -name "*.s" 2>/dev/null | while read f; do
+            clean=$(basename "$f" | sed 's/-[a-f0-9]\{16\}\.s$/.s/')
+            cp "$f" "../asm-v4/${clean}"
+          done
+          echo "v4 ASM files: $(ls ../asm-v4 2>/dev/null | wc -l)"
 
       - name: Compare ASM
         run: |
@@ -159,6 +167,28 @@ jobs:
               fi
             fi
           done
+
+          # Also compare v4 vs serial
+          V4_IDENTICAL=0; V4_DIFFERENT=0; V4_ONLY_SERIAL=0; V4_ONLY_V4=0
+          for f in $(ls asm-serial/*.s 2>/dev/null); do
+            base=$(basename "$f")
+            if [ ! -f "asm-v4/$base" ]; then
+              V4_ONLY_SERIAL=$((V4_ONLY_SERIAL + 1))
+            else
+              if diff <(grep -v '^\s*$\|^\s*[;#]' "$f") \
+                      <(grep -v '^\s*$\|^\s*[;#]' "asm-v4/$base") > /dev/null 2>&1; then
+                V4_IDENTICAL=$((V4_IDENTICAL + 1))
+              else
+                V4_DIFFERENT=$((V4_DIFFERENT + 1))
+              fi
+            fi
+          done
+          for f in $(ls asm-v4/*.s 2>/dev/null); do
+            base=$(basename "$f")
+            [ ! -f "asm-serial/$base" ] && V4_ONLY_V4=$((V4_ONLY_V4 + 1))
+          done
+          [ "$V4_DIFFERENT" -eq 0 ] && [ "$V4_ONLY_SERIAL" -eq 0 ] && [ "$V4_ONLY_V4" -eq 0 ] \
+            && V4_VERDICT="✅ IDENTICAL" || V4_VERDICT="⚠️ DIFFERENCES"
 
           for f in $(ls asm-parallel/*.s 2>/dev/null); do
             base=$(basename "$f")
@@ -204,6 +234,17 @@ jobs:
           | ❌ Different | ${DIFFERENT} |
           | Only serial | ${ONLY_SERIAL} |
           | Only parallel | ${ONLY_PARALLEL} |
+
+          ## 🔬 v4 ASM Equivalence (vs serial)
+
+          **${V4_VERDICT:-N/A}**
+
+          | Metric | Value |
+          |---|---|
+          | ✅ Identical | ${V4_IDENTICAL:-?} |
+          | ❌ Different | ${V4_DIFFERENT:-?} |
+          | Only serial | ${V4_ONLY_SERIAL:-?} |
+          | Only v4 | ${V4_ONLY_V4:-?} |
           REPORT
 
           echo ""
