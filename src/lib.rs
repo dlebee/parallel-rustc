@@ -5,3 +5,4 @@ pub mod builder;
 pub mod graph;
 pub mod metadata;
 pub mod plan;
+pub mod recorder;
