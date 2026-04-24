@@ -104,32 +104,32 @@ pub async fn run_build_v4(config: &BuildConfig) -> Result<BuildV4Summary, String
     let mut driven_units = 0usize;
 
     if config.batched {
-        // Batched mode: collect every package that has a 'build'-mode unit
-        // into a single cargo invocation with -p flags. Use one shared iso
-        // target dir for the whole build; no phase-by-phase seeding/merging.
-        let mut pkgs: Vec<&UnitGraphUnit> = Vec::new();
-        let mut seen_pkg: std::collections::HashSet<&str> =
-            std::collections::HashSet::new();
-        for u in &units {
-            if u.mode == "build" && seen_pkg.insert(u.pkg_id.as_str()) {
-                pkgs.push(u);
+        // Batched mode: one cargo invocation per phase (all pkgs in the phase as
+        // -p flags), respecting dependency order across phases.
+        // This avoids Cargo's feature resolver panic that occurs when mixing
+        // packages from different dependency levels in a single invocation.
+        for (pi, phase_idxs) in phases.iter().enumerate() {
+            let mut pkgs: Vec<&UnitGraphUnit> = Vec::new();
+            let mut seen_pkg: std::collections::HashSet<&str> =
+                std::collections::HashSet::new();
+            for &idx in phase_idxs {
+                let u = &units[idx];
+                if u.mode == "build" && seen_pkg.insert(u.pkg_id.as_str()) {
+                    pkgs.push(u);
+                }
             }
+            if pkgs.is_empty() { continue; }
+            println!(
+                "  phase {} batched: {} pkgs, -j{}",
+                pi, pkgs.len(), config.jobs
+            );
+            let ph_t = Instant::now();
+            // Batched: use the normal target dir (no isolation needed
+            // since we run one cargo invocation at a time per phase).
+            run_phase_batched(&pkgs, config).await?;
+            driven_units += pkgs.len();
+            println!("    done in {:.2}s", ph_t.elapsed().as_secs_f64());
         }
-        println!(
-            "  batched: single cargo invocation over {} pkgs, -j{}",
-            pkgs.len(), config.jobs
-        );
-        let phase_iso = iso_root.join("all");
-        fs::create_dir_all(&phase_iso)
-            .map_err(|e| format!("mkdir iso/all: {e}"))?;
-        let ph_t = Instant::now();
-        run_phase_batched(&pkgs, &phase_iso, config).await?;
-        merge_into(
-            &phase_iso.join(profile_name),
-            &merged.join(profile_name),
-        )?;
-        driven_units = pkgs.len();
-        println!("    done in {:.2}s", ph_t.elapsed().as_secs_f64());
     } else {
     for (pi, phase_idxs) in phases.iter().enumerate() {
         // Collect one representative unit per pkg_id, mode == "build".
@@ -246,13 +246,12 @@ pub async fn run_build_v4(config: &BuildConfig) -> Result<BuildV4Summary, String
 
 async fn run_phase_batched(
     pkgs: &[&UnitGraphUnit],
-    phase_iso: &Path,
     config: &BuildConfig,
 ) -> Result<(), String> {
     // Single cargo invocation for the whole phase, passing every package
-    // with its own `-p`. Cargo will plan internal rustc parallelism via
-    // `-j<config.jobs>`. All artifacts land in one shared iso dir, which
-    // we merge back afterwards.
+    // with its own `-p`. Cargo handles parallelism internally via `-j`.
+    // Uses the normal target dir (no isolation) since batched phases are
+    // sequential — no lock contention.
     let mut cmd = Command::new("cargo");
     cmd.arg("build");
     for u in pkgs {
@@ -265,7 +264,6 @@ async fn run_phase_batched(
     if let Some(p) = &config.manifest_path {
         cmd.arg("--manifest-path").arg(p);
     }
-    cmd.env("CARGO_TARGET_DIR", phase_iso);
     // Suppress stdout; keep stderr visible so errors surface.
     cmd.stdout(Stdio::null()).stderr(Stdio::inherit());
 
