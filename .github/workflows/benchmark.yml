@@ -1,0 +1,213 @@
+name: Benchmark — Serial vs Parallel Plan
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: 'Public GitHub repo URL (e.g. https://github.com/tokio-rs/tokio)'
+        required: true
+        type: string
+      manifest_path:
+        description: 'Path to Cargo.toml relative to repo root (default: Cargo.toml)'
+        required: false
+        default: 'Cargo.toml'
+        type: string
+      rust_toolchain:
+        description: 'Rust toolchain (default: stable)'
+        required: false
+        default: 'stable'
+        type: string
+
+jobs:
+  serial-build:
+    name: Serial Build (-j1)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ inputs.rust_toolchain }}
+
+      - name: Clone target repo
+        run: git clone --depth 1 ${{ inputs.repo_url }} target-repo
+
+      - name: Build (serial, -j1)
+        working-directory: target-repo
+        run: |
+          echo "::group::cargo build -j1"
+          START=$(date +%s%N)
+          cargo build -j1 --manifest-path ${{ inputs.manifest_path }} 2>&1
+          END=$(date +%s%N)
+          ELAPSED_MS=$(( (END - START) / 1000000 ))
+          echo "::endgroup::"
+          echo "## Serial Build" >> $GITHUB_STEP_SUMMARY
+          echo "- **Time:** ${ELAPSED_MS}ms ($(( ELAPSED_MS / 1000 ))s)" >> $GITHUB_STEP_SUMMARY
+          echo "SERIAL_MS=${ELAPSED_MS}" >> serial-timing.txt
+
+      - name: Upload timing
+        uses: actions/upload-artifact@v4
+        with:
+          name: serial-timing
+          path: target-repo/serial-timing.txt
+
+  parallel-build:
+    name: Parallel Build (default -j)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ inputs.rust_toolchain }}
+
+      - name: Clone target repo
+        run: git clone --depth 1 ${{ inputs.repo_url }} target-repo
+
+      - name: Build (parallel, default -j)
+        working-directory: target-repo
+        run: |
+          CPUS=$(nproc)
+          echo "::group::cargo build (${CPUS} CPUs)"
+          START=$(date +%s%N)
+          cargo build --manifest-path ${{ inputs.manifest_path }} 2>&1
+          END=$(date +%s%N)
+          ELAPSED_MS=$(( (END - START) / 1000000 ))
+          echo "::endgroup::"
+          echo "## Parallel Build" >> $GITHUB_STEP_SUMMARY
+          echo "- **Time:** ${ELAPSED_MS}ms ($(( ELAPSED_MS / 1000 ))s)" >> $GITHUB_STEP_SUMMARY
+          echo "- **CPUs:** ${CPUS}" >> $GITHUB_STEP_SUMMARY
+          echo "PARALLEL_MS=${ELAPSED_MS}" >> parallel-timing.txt
+          echo "CPUS=${CPUS}" >> parallel-timing.txt
+
+      - name: Upload timing
+        uses: actions/upload-artifact@v4
+        with:
+          name: parallel-timing
+          path: target-repo/parallel-timing.txt
+
+  phase-analysis:
+    name: Phase Analysis (parallel-rustc plan)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout parallel-rustc
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ inputs.rust_toolchain }}
+
+      - name: Build parallel-rustc
+        run: cargo build --release
+
+      - name: Clone target repo
+        run: git clone --depth 1 ${{ inputs.repo_url }} target-repo
+
+      - name: Run parallel-rustc plan
+        working-directory: target-repo
+        run: |
+          echo "::group::parallel-rustc plan"
+          ../target/release/parallel-rustc plan --manifest-path ${{ inputs.manifest_path }} | tee plan-output.txt
+          echo "::endgroup::"
+
+          PACKAGES=$(head -5 plan-output.txt | grep -o 'packages: [0-9]*' | grep -o '[0-9]*' || echo "0")
+          PHASES=$(head -5 plan-output.txt | grep -o 'phases: [0-9]*' | grep -o '[0-9]*' || echo "0")
+          MAX_WIDTH=0
+          while IFS= read -r line; do
+            if echo "$line" | grep -q "^phase .* packages"; then
+              W=$(echo "$line" | grep -o '[0-9]* packages' | grep -o '[0-9]*')
+              if [ "$W" -gt "$MAX_WIDTH" ] 2>/dev/null; then MAX_WIDTH=$W; fi
+            fi
+          done < plan-output.txt
+
+          echo "PACKAGES=${PACKAGES}" >> plan-stats.txt
+          echo "PHASES=${PHASES}" >> plan-stats.txt
+          echo "MAX_WIDTH=${MAX_WIDTH}" >> plan-stats.txt
+          cp plan-output.txt plan-full.txt
+
+      - name: Upload plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan-output
+          path: |
+            target-repo/plan-stats.txt
+            target-repo/plan-full.txt
+
+  compare:
+    name: Compare Results
+    needs: [serial-build, parallel-build, phase-analysis]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate comparison report
+        run: |
+          SERIAL_MS=$(grep SERIAL_MS artifacts/serial-timing/serial-timing.txt | cut -d= -f2)
+          PARALLEL_MS=$(grep PARALLEL_MS artifacts/parallel-timing/parallel-timing.txt | cut -d= -f2)
+          CPUS=$(grep CPUS artifacts/parallel-timing/parallel-timing.txt | cut -d= -f2)
+          PACKAGES=$(grep PACKAGES artifacts/plan-output/plan-stats.txt | cut -d= -f2)
+          PHASES=$(grep PHASES artifacts/plan-output/plan-stats.txt | cut -d= -f2)
+          MAX_WIDTH=$(grep MAX_WIDTH artifacts/plan-output/plan-stats.txt | cut -d= -f2)
+
+          if [ "$PARALLEL_MS" -gt 0 ] 2>/dev/null; then
+            SPEEDUP=$(echo "scale=2; $SERIAL_MS / $PARALLEL_MS" | bc 2>/dev/null || echo "?")
+          else
+            SPEEDUP="?"
+          fi
+          if [ "$PHASES" -gt 0 ] 2>/dev/null; then
+            THEORETICAL=$(echo "scale=2; $PACKAGES / $PHASES" | bc 2>/dev/null || echo "?")
+          else
+            THEORETICAL="?"
+          fi
+
+          SERIAL_S=$(echo "scale=1; $SERIAL_MS / 1000" | bc 2>/dev/null || echo "?")
+          PARALLEL_S=$(echo "scale=1; $PARALLEL_MS / 1000" | bc 2>/dev/null || echo "?")
+
+          cat >> $GITHUB_STEP_SUMMARY << REPORT
+          # 🏁 Benchmark Results
+
+          **Target:** \`${{ inputs.repo_url }}\`
+          **Manifest:** \`${{ inputs.manifest_path }}\`
+          **Toolchain:** \`${{ inputs.rust_toolchain }}\`
+          **Runner CPUs:** ${CPUS}
+
+          ## Timings
+
+          | Build Mode | Time | Notes |
+          |---|---|---|
+          | Serial (\`-j1\`) | **${SERIAL_S}s** (${SERIAL_MS}ms) | Single-threaded baseline |
+          | Parallel (default) | **${PARALLEL_S}s** (${PARALLEL_MS}ms) | Cargo's built-in parallelism |
+          | **Actual speedup** | **${SPEEDUP}×** | parallel / serial |
+
+          ## Phase Analysis (parallel-rustc)
+
+          | Metric | Value |
+          |---|---|
+          | Total packages | ${PACKAGES} |
+          | Phases (min serial depth) | ${PHASES} |
+          | Max phase width | ${MAX_WIDTH} |
+          | Theoretical max parallelism | ${THEORETICAL}× |
+
+          ## Phase Plan
+
+          \`\`\`
+          $(cat artifacts/plan-output/plan-full.txt)
+          \`\`\`
+
+          ## Interpretation
+
+          - **Actual speedup** (${SPEEDUP}×) shows what Cargo achieves with built-in parallelism on ${CPUS} CPUs.
+          - **Theoretical max** (${THEORETICAL}×) is the upper bound assuming infinite CPUs and uniform crate compile times.
+          - Gap between actual and theoretical = room for smarter scheduling (e.g., .rmeta-based early starts, critical-path prioritization).
+          REPORT
+
+      - name: Print summary to log
+        run: |
+          echo "=== Serial ==="
+          cat artifacts/serial-timing/serial-timing.txt
+          echo "=== Parallel ==="
+          cat artifacts/parallel-timing/parallel-timing.txt
+          echo "=== Plan ==="
+          cat artifacts/plan-output/plan-full.txt
