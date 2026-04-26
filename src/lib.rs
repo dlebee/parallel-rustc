@@ -3,6 +3,7 @@
 pub mod bench;
 pub mod builder;
 pub mod builder_v4;
+pub mod builder_v5;
 pub mod graph;
 pub mod metadata;
 pub mod plan;

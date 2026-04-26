@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use parallel_rustc::builder::BuildConfig;
-use parallel_rustc::{bench, builder, builder_v4, graph, metadata, plan, unit_graph};
+use parallel_rustc::{bench, builder, builder_v4, builder_v5, graph, metadata, plan, unit_graph};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -96,6 +96,24 @@ enum Command {
         #[arg(long, default_value_t = false)]
         batched: bool,
     },
+    /// Build the workspace using the v0.5.0 RUSTC_WRAPPER metadata-pipelining
+    /// executor.
+    ///
+    /// Sets RUSTC_WRAPPER=parallel-rustc-coordinator and runs `cargo build`.
+    /// The coordinator emits only `.rmeta` for each crate (fast, lets Cargo
+    /// proceed to dependents via pipelining) and queues full codegen for a
+    /// later parallel pass driven by parallel-rustc. See spec/0.5.0.md.
+    BuildV5 {
+        #[arg(long, value_name = "PATH")]
+        manifest_path: Option<PathBuf>,
+
+        #[arg(long, default_value_t = false)]
+        release: bool,
+
+        /// Max parallel processes per codegen phase.
+        #[arg(short = 'j', long, default_value_t = default_jobs())]
+        jobs: usize,
+    },
     /// Cold-build the workspace three ways (serial, cargo -jN, parallel-rustc v4)
     /// and print a comparison table.
     Bench {
@@ -161,6 +179,16 @@ fn main() -> ExitCode {
                     batched,
                 };
                 builder_v4::run_build_v4(&config).await.map(|_| ())
+            }
+            Command::BuildV5 { manifest_path, release, jobs } => {
+                let config = BuildConfig {
+                    manifest_path,
+                    release,
+                    jobs,
+                    workspace_only: false,
+                    batched: false,
+                };
+                builder_v5::run_build_v5(&config).await.map(|_| ())
             }
             Command::Bench { manifest_path, release, jobs, workspace_only, with_batched } => {
                 let config = BuildConfig {
