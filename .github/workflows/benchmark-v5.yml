@@ -2,7 +2,7 @@ name: benchmark-v5
 
 on:
   push:
-    branches: [feature/v5-wrapper, main]
+    branches: [feature/v5-wrapper, feature/v5-shallow-classifier, main]
   workflow_dispatch:
 
 jobs:
@@ -35,13 +35,11 @@ jobs:
           cd /tmp/cargo-src
           cargo clean
           START=$SECONDS
-          cargo build 2>&1 | tail -5
-          CODE=$?
+          cargo build 2>&1 | tail -3
           BASELINE_S=$((SECONDS - START))
           echo "baseline_s=$BASELINE_S" >> $GITHUB_OUTPUT
-          echo "baseline_code=$CODE" >> $GITHUB_OUTPUT
-          echo "### Baseline: cargo build (default -j)" >> $GITHUB_STEP_SUMMARY
-          echo "Time: **${BASELINE_S}s** on $(nproc) CPUs  exit=$CODE" >> $GITHUB_STEP_SUMMARY
+          echo "### Baseline: cargo build (default -j, $(nproc) CPUs)" >> $GITHUB_STEP_SUMMARY
+          echo "Time: **${BASELINE_S}s**" >> $GITHUB_STEP_SUMMARY
 
       - name: v5 — parallel-rustc build-v5
         id: v5
@@ -56,10 +54,10 @@ jobs:
           V5_S=$((SECONDS - START))
           echo "v5_s=$V5_S" >> $GITHUB_OUTPUT
           echo "v5_code=$CODE" >> $GITHUB_OUTPUT
-          echo "### v5: parallel-rustc build-v5" >> $GITHUB_STEP_SUMMARY
-          echo "Time: **${V5_S}s** on $(nproc) CPUs  exit=$CODE" >> $GITHUB_STEP_SUMMARY
+          echo "### v5: parallel-rustc build-v5 ($(nproc) CPUs)" >> $GITHUB_STEP_SUMMARY
+          echo "Time: **${V5_S}s**  exit=$CODE" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          grep -v "^   Compiling\|^    Finished" /tmp/v5-output.txt | tail -20 >> $GITHUB_STEP_SUMMARY
+          grep -v "^   Compiling\|^    Finished\|message_type" /tmp/v5-output.txt | tail -25 >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Summary
@@ -67,15 +65,15 @@ jobs:
         run: |
           BASELINE=${{ steps.baseline.outputs.baseline_s || 0 }}
           V5=${{ steps.v5.outputs.v5_s || 0 }}
-          echo "## Result" >> $GITHUB_STEP_SUMMARY
-          echo "| | Time | exit |" >> $GITHUB_STEP_SUMMARY
-          echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| cargo build (default) | ${BASELINE}s | ${{ steps.baseline.outputs.baseline_code }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| parallel-rustc v5 | ${V5}s | ${{ steps.v5.outputs.v5_code }} |" >> $GITHUB_STEP_SUMMARY
+          echo "## Result ($(nproc) CPUs)" >> $GITHUB_STEP_SUMMARY
+          echo "| | Time |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| cargo build (default) | ${BASELINE}s |" >> $GITHUB_STEP_SUMMARY
+          echo "| parallel-rustc v5 | ${V5}s |" >> $GITHUB_STEP_SUMMARY
           if [ "$V5" -gt 0 ] && [ "$BASELINE" -gt 0 ]; then
             RATIO=$(python3 -c "print(f'{$BASELINE/$V5:.2f}')")
-            echo "| **speedup** | **${RATIO}x** | |" >> $GITHUB_STEP_SUMMARY
-            echo "Baseline: ${BASELINE}s | v5: ${V5}s | speedup: ${RATIO}x"
+            echo "| **speedup** | **${RATIO}x** |" >> $GITHUB_STEP_SUMMARY
+            echo "Baseline: ${BASELINE}s | v5: ${V5}s | speedup: ${RATIO}x on $(nproc) CPUs"
           else
-            echo "One or both builds failed — no speedup computed."
+            echo "One or both builds failed."
           fi
