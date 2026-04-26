@@ -14,8 +14,11 @@ jobs:
       - name: Checkout parallel-rustc
         uses: actions/checkout@v4
 
-      - name: Install Rust stable + nightly (for unit-graph)
+      - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install nightly (for unit-graph classifier)
+        run: rustup toolchain install nightly --no-self-update
 
       - name: Install build deps (for rust-lang/cargo)
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libcurl4-openssl-dev libssh2-1-dev

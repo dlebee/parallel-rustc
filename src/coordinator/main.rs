@@ -10,14 +10,33 @@
 //! Queue format: one JSON object per line
 //!   {"cwd": "...", "env": [[k,v],...], "argv": ["rustc", ...]}
 
+use std::collections::HashSet;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::process::{self, Command};
+use std::sync::OnceLock;
 
 const QUEUE_ENV: &str = "PARALLEL_RUSTC_QUEUE";
+const NEEDS_RLIB_ENV: &str = "PARALLEL_RUSTC_NEEDS_RLIB";
+
+/// Crate names (underscore-normalized) the v5 builder pre-classified as
+/// needing a full `.rlib` during cargo's forward pass. Read from
+/// `PARALLEL_RUSTC_NEEDS_RLIB` once on first use.
+fn needs_rlib_set() -> &'static HashSet<String> {
+    static CELL: OnceLock<HashSet<String>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        env::var(NEEDS_RLIB_ENV)
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
+    })
+}
 
 const CAPTURED_ENV: &[&str] = &[
     "CARGO", "CARGO_MANIFEST_DIR", "CARGO_PKG_NAME", "CARGO_PKG_VERSION",
@@ -85,6 +104,12 @@ fn should_passthrough(args: &[String]) -> bool {
     }
     if let Some(name) = find_value(args, "--crate-name") {
         if name.starts_with("build_script_") {
+            return true;
+        }
+        // v0.5.1: pre-classified needs-rlib set wins. These crates are
+        // (transitive) dependencies of build scripts or proc-macros and will
+        // be linked during cargo's forward pass — they need a real .rlib.
+        if needs_rlib_set().contains(&name) {
             return true;
         }
     }

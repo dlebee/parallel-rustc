@@ -13,6 +13,7 @@ use tokio::process::Command;
 use tokio::task::JoinSet;
 
 use crate::builder::BuildConfig;
+use crate::classifier::{classify_from_unit_graph, ClassifiedUnits};
 use crate::recorder::{assign_phases, RustcUnit};
 
 #[derive(Debug, Clone)]
@@ -67,9 +68,26 @@ pub async fn run_build_v5(config: &BuildConfig) -> Result<BuildV5Summary, String
     let _ = std::fs::remove_file(&queue_file);
     let overall = Instant::now();
 
+    // Pass 0 — pre-classify the unit graph so the coordinator knows which
+    // crates need a full .rlib during the forward pass (build-script deps,
+    // proc-macro lib deps) versus which can be deferred to parallel codegen.
+    println!("[0/3] pre-classifying unit-graph (cargo +nightly --unit-graph)...");
+    let classify_started = Instant::now();
+    let classified = classify_from_unit_graph(
+        config.manifest_path.as_deref(),
+        config.release,
+    )?;
+    println!(
+        "      pre-classification: {} passthrough, {} deferred ({} units total) in {:.2}s",
+        classified.needs_rlib.len(),
+        classified.defer_codegen.len(),
+        classified.total_units,
+        classify_started.elapsed().as_secs_f64(),
+    );
+
     println!("[1/3] cargo build (metadata-only forward pass)...");
     let cargo_started = Instant::now();
-    run_cargo_with_coordinator(&coordinator, &queue_file, config).await?;
+    run_cargo_with_coordinator(&coordinator, &queue_file, &classified, config).await?;
     let cargo_pass = cargo_started.elapsed();
     println!("      done in {:.2}s", cargo_pass.as_secs_f64());
 
@@ -107,6 +125,7 @@ pub async fn run_build_v5(config: &BuildConfig) -> Result<BuildV5Summary, String
 async fn run_cargo_with_coordinator(
     coordinator: &Path,
     queue_file: &Path,
+    classified: &ClassifiedUnits,
     config: &BuildConfig,
 ) -> Result<(), String> {
     let mut cmd = Command::new("cargo");
@@ -117,6 +136,19 @@ async fn run_cargo_with_coordinator(
     }
     cmd.env("RUSTC_WRAPPER", coordinator);
     cmd.env("PARALLEL_RUSTC_QUEUE", queue_file);
+
+    // v0.5.1: tell the coordinator which crate names need a full .rlib
+    // produced during the forward pass (build-script deps + proc-macro deps,
+    // transitively). Anything not in this CSV may be deferred to the parallel
+    // codegen replay phase.
+    let mut needs_rlib_sorted: Vec<&String> = classified.needs_rlib.iter().collect();
+    needs_rlib_sorted.sort();
+    let needs_rlib_csv = needs_rlib_sorted
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    cmd.env("PARALLEL_RUSTC_NEEDS_RLIB", needs_rlib_csv);
     cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
 
     let status = cmd.status().await

@@ -38,6 +38,11 @@ pub struct UnitGraphUnit {
     pub src_path: String,
     pub edition: String,
     pub crate_types: Vec<String>,
+    /// `target.kind` from cargo's unit-graph output, e.g. `["lib"]`,
+    /// `["proc-macro"]`, `["bin"]`, `["custom-build"]`. Needed (in
+    /// addition to `mode`) by the v0.5.1 needs-rlib pre-classifier to
+    /// identify proc-macro targets.
+    pub kind: Vec<String>,
     /// "build" | "run-custom-build" | "check" | "test" | "doc" | ...
     pub mode: String,
     pub features: Vec<String>,
@@ -86,7 +91,6 @@ struct RawTarget {
     edition: String,
     #[serde(default)]
     crate_types: Vec<String>,
-    #[allow(dead_code)]
     #[serde(default)]
     kind: Vec<String>,
 }
@@ -188,6 +192,7 @@ pub fn parse_unit_graph(bytes: &[u8]) -> Result<Vec<UnitGraphUnit>, String> {
                 src_path: u.target.src_path,
                 edition: u.target.edition,
                 crate_types: u.target.crate_types,
+                kind: u.target.kind,
                 mode: u.mode,
                 features: u.features,
                 opt_level: u.profile.opt_level,
@@ -394,6 +399,7 @@ mod tests {
             src_path: format!("/tmp/{name}/src/lib.rs"),
             edition: "2021".into(),
             crate_types: vec!["lib".into()],
+            kind: vec!["lib".into()],
             mode: mode.into(),
             features: vec![],
             opt_level: "0".into(),
