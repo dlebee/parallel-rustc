@@ -14,13 +14,11 @@ jobs:
       - name: Checkout parallel-rustc
         uses: actions/checkout@v4
 
-      - name: Install Rust stable (1.94.0)
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.94.0
+      - name: Install Rust stable + nightly (for unit-graph)
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install build deps (for rust-lang/cargo)
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libcurl4-openssl-dev libssh2-1-dev
 
       - name: Build parallel-rustc (release)
         run: cargo build --release
@@ -35,10 +33,12 @@ jobs:
           cargo clean
           START=$SECONDS
           cargo build 2>&1 | tail -5
+          CODE=$?
           BASELINE_S=$((SECONDS - START))
           echo "baseline_s=$BASELINE_S" >> $GITHUB_OUTPUT
+          echo "baseline_code=$CODE" >> $GITHUB_OUTPUT
           echo "### Baseline: cargo build (default -j)" >> $GITHUB_STEP_SUMMARY
-          echo "Time: **${BASELINE_S}s** on $(nproc) CPUs" >> $GITHUB_STEP_SUMMARY
+          echo "Time: **${BASELINE_S}s** on $(nproc) CPUs  exit=$CODE" >> $GITHUB_STEP_SUMMARY
 
       - name: v5 — parallel-rustc build-v5
         id: v5
@@ -49,22 +49,30 @@ jobs:
           $GITHUB_WORKSPACE/target/release/parallel-rustc build-v5 \
             --manifest-path Cargo.toml \
             --jobs $(nproc) 2>&1 | tee /tmp/v5-output.txt
+          CODE=$?
           V5_S=$((SECONDS - START))
           echo "v5_s=$V5_S" >> $GITHUB_OUTPUT
+          echo "v5_code=$CODE" >> $GITHUB_OUTPUT
           echo "### v5: parallel-rustc build-v5" >> $GITHUB_STEP_SUMMARY
-          echo "Time: **${V5_S}s** on $(nproc) CPUs" >> $GITHUB_STEP_SUMMARY
+          echo "Time: **${V5_S}s** on $(nproc) CPUs  exit=$CODE" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           grep -v "^   Compiling\|^    Finished" /tmp/v5-output.txt | tail -20 >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Summary
+        if: always()
         run: |
-          BASELINE=${{ steps.baseline.outputs.baseline_s }}
-          V5=${{ steps.v5.outputs.v5_s }}
-          RATIO=$(python3 -c "print(f'{$BASELINE/$V5:.2f}')")
+          BASELINE=${{ steps.baseline.outputs.baseline_s || 0 }}
+          V5=${{ steps.v5.outputs.v5_s || 0 }}
           echo "## Result" >> $GITHUB_STEP_SUMMARY
-          echo "| | Time | Speedup |" >> $GITHUB_STEP_SUMMARY
+          echo "| | Time | exit |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| cargo build (default) | ${BASELINE}s | 1.00x |" >> $GITHUB_STEP_SUMMARY
-          echo "| parallel-rustc v5 | ${V5}s | ${RATIO}x |" >> $GITHUB_STEP_SUMMARY
-          echo "Baseline: ${BASELINE}s | v5: ${V5}s | speedup: ${RATIO}x"
+          echo "| cargo build (default) | ${BASELINE}s | ${{ steps.baseline.outputs.baseline_code }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| parallel-rustc v5 | ${V5}s | ${{ steps.v5.outputs.v5_code }} |" >> $GITHUB_STEP_SUMMARY
+          if [ "$V5" -gt 0 ] && [ "$BASELINE" -gt 0 ]; then
+            RATIO=$(python3 -c "print(f'{$BASELINE/$V5:.2f}')")
+            echo "| **speedup** | **${RATIO}x** | |" >> $GITHUB_STEP_SUMMARY
+            echo "Baseline: ${BASELINE}s | v5: ${V5}s | speedup: ${RATIO}x"
+          else
+            echo "One or both builds failed — no speedup computed."
+          fi
