@@ -4,6 +4,10 @@ on:
   push:
     branches: [feature/v5-wrapper, feature/v5-shallow-classifier, main]
   workflow_dispatch:
+    inputs:
+      jobs_multiplier:
+        description: 'Job count multiplier over nproc (default 2)'
+        default: '2'
 
 jobs:
   bench-cargo:
@@ -20,7 +24,7 @@ jobs:
       - name: Install nightly (for unit-graph classifier)
         run: rustup toolchain install nightly --no-self-update
 
-      - name: Install build deps (for rust-lang/cargo)
+      - name: Install build deps
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libcurl4-openssl-dev libssh2-1-dev
 
       - name: Build parallel-rustc (release)
@@ -41,39 +45,56 @@ jobs:
           echo "### Baseline: cargo build (default -j, $(nproc) CPUs)" >> $GITHUB_STEP_SUMMARY
           echo "Time: **${BASELINE_S}s**" >> $GITHUB_STEP_SUMMARY
 
-      - name: v5 — parallel-rustc build-v5
-        id: v5
+      - name: v5 — jobs=nproc (1x)
+        id: v5_1x
         run: |
-          cd /tmp/cargo-src
-          cargo clean
+          cd /tmp/cargo-src && cargo clean
           START=$SECONDS
           $GITHUB_WORKSPACE/target/release/parallel-rustc build-v5 \
-            --manifest-path Cargo.toml \
-            --jobs $(nproc) 2>&1 | tee /tmp/v5-output.txt
-          CODE=$?
-          V5_S=$((SECONDS - START))
-          echo "v5_s=$V5_S" >> $GITHUB_OUTPUT
-          echo "v5_code=$CODE" >> $GITHUB_OUTPUT
-          echo "### v5: parallel-rustc build-v5 ($(nproc) CPUs)" >> $GITHUB_STEP_SUMMARY
-          echo "Time: **${V5_S}s**  exit=$CODE" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          grep -v "^   Compiling\|^    Finished\|message_type" /tmp/v5-output.txt | tail -25 >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+            --manifest-path Cargo.toml --jobs $(nproc) 2>&1 | tail -8
+          echo "v5_1x_s=$((SECONDS-START))" >> $GITHUB_OUTPUT
+          echo "**v5 jobs=$(nproc) (1x):** $((SECONDS-START))s" >> $GITHUB_STEP_SUMMARY
+
+      - name: v5 — jobs=nproc*2 (2x)
+        id: v5_2x
+        run: |
+          cd /tmp/cargo-src && cargo clean
+          JOBS=$(( $(nproc) * 2 ))
+          START=$SECONDS
+          $GITHUB_WORKSPACE/target/release/parallel-rustc build-v5 \
+            --manifest-path Cargo.toml --jobs $JOBS 2>&1 | tail -8
+          echo "v5_2x_s=$((SECONDS-START))" >> $GITHUB_OUTPUT
+          echo "**v5 jobs=$JOBS (2x):** $((SECONDS-START))s" >> $GITHUB_STEP_SUMMARY
+
+      - name: v5 — jobs=nproc*4 (4x)
+        id: v5_4x
+        run: |
+          cd /tmp/cargo-src && cargo clean
+          JOBS=$(( $(nproc) * 4 ))
+          START=$SECONDS
+          $GITHUB_WORKSPACE/target/release/parallel-rustc build-v5 \
+            --manifest-path Cargo.toml --jobs $JOBS 2>&1 | tail -8
+          echo "v5_4x_s=$((SECONDS-START))" >> $GITHUB_OUTPUT
+          echo "**v5 jobs=$JOBS (4x):** $((SECONDS-START))s" >> $GITHUB_STEP_SUMMARY
 
       - name: Summary
         if: always()
         run: |
-          BASELINE=${{ steps.baseline.outputs.baseline_s || 0 }}
-          V5=${{ steps.v5.outputs.v5_s || 0 }}
-          echo "## Result ($(nproc) CPUs)" >> $GITHUB_STEP_SUMMARY
-          echo "| | Time |" >> $GITHUB_STEP_SUMMARY
-          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| cargo build (default) | ${BASELINE}s |" >> $GITHUB_STEP_SUMMARY
-          echo "| parallel-rustc v5 | ${V5}s |" >> $GITHUB_STEP_SUMMARY
-          if [ "$V5" -gt 0 ] && [ "$BASELINE" -gt 0 ]; then
-            RATIO=$(python3 -c "print(f'{$BASELINE/$V5:.2f}')")
-            echo "| **speedup** | **${RATIO}x** |" >> $GITHUB_STEP_SUMMARY
-            echo "Baseline: ${BASELINE}s | v5: ${V5}s | speedup: ${RATIO}x on $(nproc) CPUs"
-          else
-            echo "One or both builds failed."
-          fi
+          B=${{ steps.baseline.outputs.baseline_s || 0 }}
+          J1=${{ steps.v5_1x.outputs.v5_1x_s || 0 }}
+          J2=${{ steps.v5_2x.outputs.v5_2x_s || 0 }}
+          J4=${{ steps.v5_4x.outputs.v5_4x_s || 0 }}
+          NCPU=$(nproc)
+          echo "## Results on ${NCPU} CPUs" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | Time | Speedup |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| cargo (default -j) | ${B}s | 1.00x |" >> $GITHUB_STEP_SUMMARY
+          for PAIR in "${J1}:${NCPU}" "${J2}:$((NCPU*2))" "${J4}:$((NCPU*4))"; do
+            T=${PAIR%%:*}; J=${PAIR##*:}
+            if [ "$T" -gt 0 ] && [ "$B" -gt 0 ]; then
+              R=$(python3 -c "print(f'{$B/$T:.2f}')")
+              echo "| v5 --jobs $J | ${T}s | ${R}x |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+          echo ""
+          echo "Baseline=${B}s | j${NCPU}=${J1}s | j$((NCPU*2))=${J2}s | j$((NCPU*4))=${J4}s"
