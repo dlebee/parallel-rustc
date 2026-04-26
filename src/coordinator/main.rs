@@ -1,49 +1,75 @@
 //! `parallel-rustc-coordinator` — RUSTC_WRAPPER for v0.5.0 metadata pipelining.
 //!
-//! Goal: let Cargo's forward pass advance to dependents as soon as `.rmeta`
-//! is ready, while the producer's `.rlib` continues codegen in the background
-//! in parallel with other crates' `.rmeta` work.
+//! Implements the spec/0.5.0.md approach:
 //!
-//! ## Algorithm (per invocation)
+//! - Probes (`-vV`, `--print …`) and build-script binaries: exec rustc directly.
+//! - Lib crates (--emit contains metadata AND link):
+//!   1. Rewrite `--emit` → `dep-info,metadata` (fast, produces .rmeta only)
+//!   2. Run rustc → .rmeta lands on disk
+//!   3. Queue ORIGINAL args + captured env → orchestrator runs full codegen later
+//!   4. Return success to Cargo
+//! - Crates with link but no metadata (bins/proc-macro wrapper entries):
+//!   1. Return success to Cargo WITHOUT running rustc
+//!   2. Queue original args + env for orchestrator's codegen pass
 //!
-//! 1. Detect probes (`-vV`, `--print …`) and build-script binaries → exec
-//!    rustc directly and exit.
-//! 2. Otherwise, before launching rustc, wait until every `--extern name=PATH`
-//!    file exists on disk. (Some upstream may still be doing codegen in the
-//!    background from an earlier coordinator call.)
-//! 3. Spawn rustc with the *original* args (full `--emit=…,metadata,link`).
-//!    rustc writes `.rmeta` early in compilation, then continues to `.rlib`.
-//! 4. Poll for the `.rmeta` to appear on disk. Once it's there, return
-//!    success to Cargo immediately — the rustc child continues codegen in
-//!    the background (we deliberately leak the `Child` handle).
-//! 5. Append a record of the in-flight invocation (PID, expected outputs,
-//!    argv) to the shared queue file under `flock`. The orchestrator will
-//!    wait for all PIDs to terminate before reporting overall success.
+//! ## Queue format (one JSON per line)
 //!
-//! No metadata-rewrite is required: rustc's normal `--emit=…,metadata,link`
-//! already produces `.rmeta` before `.rlib`. We just need to return early.
+//!   [ cwd, [[env_k, env_v], ...], rustc_path, rustc_arg, ... ]
 //!
-//! ## Fallback paths
+//! This matches the format produced by `parallel-rustc-wrapper` so we can
+//! reuse `recorder::parse_recorded` / `assign_phases` in the orchestrator.
 //!
-//! - No `PARALLEL_RUSTC_QUEUE` env var → behave as plain passthrough.
-//! - `--emit` doesn't include `metadata` → no early-return win possible,
-//!   passthrough.
-//! - rustc exits before `.rmeta` appears → it failed, propagate exit code.
+//! ## Concurrency safety
+//!
+//! Multiple Cargo workers call us concurrently. Queue writes are serialised
+//! with `flock(LOCK_EX)`.
 
 use std::env;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
-use std::process::{self, Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::{self, Command};
 
 const QUEUE_ENV: &str = "PARALLEL_RUSTC_QUEUE";
-const RMETA_POLL_TIMEOUT: Duration = Duration::from_secs(120);
-const EXTERN_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+const CAPTURED_ENV: &[&str] = &[
+    "CARGO",
+    "CARGO_MANIFEST_DIR",
+    "CARGO_PKG_NAME",
+    "CARGO_PKG_VERSION",
+    "CARGO_PKG_AUTHORS",
+    "CARGO_PKG_DESCRIPTION",
+    "CARGO_PKG_HOMEPAGE",
+    "CARGO_PKG_REPOSITORY",
+    "CARGO_PKG_LICENSE",
+    "CARGO_PKG_LICENSE_FILE",
+    "CARGO_PKG_VERSION_MAJOR",
+    "CARGO_PKG_VERSION_MINOR",
+    "CARGO_PKG_VERSION_PATCH",
+    "CARGO_PKG_VERSION_PRE",
+    "CARGO_PKG_RUST_VERSION",
+    "CARGO_PKG_README",
+    "CARGO_CRATE_NAME",
+    "CARGO_BIN_NAME",
+    "CARGO_PRIMARY_PACKAGE",
+    "CARGO_TARGET_TMPDIR",
+    "OUT_DIR",
+    "LD_LIBRARY_PATH",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "RUSTC_BOOTSTRAP",
+    "RUSTC",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "TARGET",
+    "HOST",
+    "PROFILE",
+    "OPT_LEVEL",
+    "DEBUG",
+    "NUM_JOBS",
+    "RUSTFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+];
 
 fn main() {
     let args: Vec<OsString> = env::args_os().collect();
@@ -55,6 +81,7 @@ fn main() {
     let rustc = args[1].clone();
     let rustc_args: Vec<OsString> = args[2..].to_vec();
 
+    // Convert to Strings for inspection. Non-UTF-8 → passthrough.
     let rustc_args_str: Option<Vec<String>> = rustc_args
         .iter()
         .map(|s| s.to_str().map(|x| x.to_string()))
@@ -64,107 +91,49 @@ fn main() {
         None => exec_passthrough(&rustc, &rustc_args),
     };
 
+    // No queue → plain pass-through (safe fallback, works as a no-op wrapper).
+    if env::var(QUEUE_ENV).is_err() {
+        exec_passthrough(&rustc, &rustc_args);
+    }
+
     if should_passthrough(&rustc_args_str) {
         exec_passthrough(&rustc, &rustc_args);
     }
 
-    // Wait for every --extern artifact to materialize. They may be produced
-    // by background rustc children spawned by earlier coordinator calls.
-    let externs = collect_extern_paths(&rustc_args_str);
-    if let Err(e) = wait_for_paths(&externs, EXTERN_WAIT_TIMEOUT) {
-        eprintln!("parallel-rustc-coordinator: {e}");
-        process::exit(1);
-    }
+    let emit = find_value(&rustc_args_str, "--emit").unwrap_or_default();
+    let has_metadata = emit.contains("metadata");
+    let has_link = emit.contains("link");
 
-    // Spawn rustc with original args. rustc emits .rmeta early; we'll return
-    // success to Cargo as soon as it appears, leaving codegen to finish in bg.
-    let mut child = match Command::new(&rustc)
-        .args(&rustc_args)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "parallel-rustc-coordinator: failed to spawn {}: {e}",
-                rustc.to_string_lossy()
-            );
-            process::exit(1);
-        }
-    };
-    let pid = child.id();
-
-    // Compute expected .rmeta path from --crate-name + --out-dir + extra-filename.
-    let rmeta_path = expected_rmeta_path(&rustc_args_str);
-
-    // Poll for .rmeta or for rustc to exit (failure case).
-    let started = Instant::now();
-    loop {
-        // Check rustc exit: if rustc died, propagate.
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // rustc finished entirely. .rmeta may or may not exist.
-                if status.success() {
-                    // It finished fully; queue with empty pid (already done).
-                    let _ = enqueue(pid, &rmeta_path, &rustc, &rustc_args_str, true);
-                    process::exit(0);
-                } else {
-                    process::exit(status.code().unwrap_or(1));
-                }
-            }
-            Ok(None) => { /* still running */ }
+    if has_metadata {
+        // Lib crate: run metadata-only, queue full args.
+        let meta_args = rewrite_emit_metadata(&rustc_args_str);
+        let status = Command::new(&rustc).args(&meta_args).status();
+        let code = match status {
+            Ok(s) => s.code().unwrap_or(1),
             Err(e) => {
-                eprintln!("parallel-rustc-coordinator: try_wait failed: {e}");
-                let _ = child.kill();
-                process::exit(1);
+                eprintln!("parallel-rustc-coordinator: exec failed: {e}");
+                1
             }
+        };
+        if code != 0 {
+            process::exit(code);
         }
-
-        if let Some(p) = &rmeta_path {
-            if p.exists() {
-                break;
-            }
-        } else {
-            // No predictable .rmeta path — fall back to waiting for full exit.
-            // (Rare: shouldn't happen for normal lib/bin compiles.)
-            match child.wait() {
-                Ok(s) => process::exit(s.code().unwrap_or(1)),
-                Err(e) => {
-                    eprintln!("parallel-rustc-coordinator: wait failed: {e}");
-                    process::exit(1);
-                }
-            }
-        }
-
-        if started.elapsed() > RMETA_POLL_TIMEOUT {
-            eprintln!(
-                "parallel-rustc-coordinator: timeout waiting for .rmeta at {:?}",
-                rmeta_path
-            );
-            let _ = child.kill();
+        if let Err(e) = enqueue(&rustc, &rustc_args_str) {
+            eprintln!("parallel-rustc-coordinator: enqueue failed: {e}");
             process::exit(1);
         }
-        thread::sleep(POLL_INTERVAL);
-    }
-
-    // .rmeta is on disk. Record the in-flight rustc PID for the orchestrator
-    // to await after cargo's forward pass finishes, then exit success and
-    // leak the Child so the rustc process keeps running.
-    if let Err(e) = enqueue(pid, &rmeta_path, &rustc, &rustc_args_str, false) {
-        // If we can't enqueue, fall back to waiting for rustc here so the
-        // build still produces correct artifacts.
-        eprintln!("parallel-rustc-coordinator: enqueue failed: {e}; waiting for rustc");
-        match child.wait() {
-            Ok(s) => process::exit(s.code().unwrap_or(1)),
-            Err(_) => process::exit(1),
+        process::exit(0);
+    } else if has_link {
+        // Bin/dylib crate: suppress compile, queue for later full run.
+        if let Err(e) = enqueue(&rustc, &rustc_args_str) {
+            eprintln!("parallel-rustc-coordinator: enqueue (bin) failed: {e}");
+            // Fall back to running normally so the build still works.
+            exec_passthrough(&rustc, &rustc_args);
         }
+        process::exit(0);
+    } else {
+        exec_passthrough(&rustc, &rustc_args);
     }
-
-    // Detach: forget the Child so dropping it doesn't kill the process. (Rust's
-    // std::process::Child does not kill on drop, but we forget to be explicit.)
-    std::mem::forget(child);
-    process::exit(0);
 }
 
 fn should_passthrough(args: &[String]) -> bool {
@@ -174,26 +143,13 @@ fn should_passthrough(args: &[String]) -> bool {
     if args.iter().any(|a| a == "--print" || a.starts_with("--print=")) {
         return true;
     }
-    let crate_name = find_value(args, "--crate-name");
-    if let Some(name) = &crate_name {
+    if let Some(name) = find_value(args, "--crate-name") {
         if name.starts_with("build_script_") {
             return true;
         }
     }
-    if crate_name.is_none() {
-        return true;
-    }
-    // No --emit, or emit doesn't include metadata — no early-return win.
-    let emit = match find_value(args, "--emit") {
-        Some(e) => e,
-        None => return true,
-    };
-    if !emit.contains("metadata") {
-        return true;
-    }
-    // If queue env is missing, we're not orchestrated — passthrough so the
-    // build still works as a normal cargo build with our wrapper.
-    if env::var(QUEUE_ENV).is_err() {
+    // No --crate-name → not a real compile invocation.
+    if find_value(args, "--crate-name").is_none() {
         return true;
     }
     false
@@ -213,143 +169,71 @@ fn find_value(args: &[String], flag: &str) -> Option<String> {
     None
 }
 
-fn collect_extern_paths(args: &[String]) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        let val = if a == "--extern" {
-            it.next().cloned()
-        } else if let Some(rest) = a.strip_prefix("--extern=") {
-            Some(rest.to_string())
-        } else {
-            None
-        };
-        if let Some(v) = val {
-            // value is `name=path` or just `name` (no path → builtin like proc_macro).
-            if let Some(eq) = v.find('=') {
-                let path = &v[eq + 1..];
-                out.push(PathBuf::from(path));
-            }
+fn rewrite_emit_metadata(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--emit" && i + 1 < args.len() {
+            out.push("--emit=dep-info,metadata".to_string());
+            i += 2;
+            continue;
         }
+        if a.starts_with("--emit=") {
+            out.push("--emit=dep-info,metadata".to_string());
+            i += 1;
+            continue;
+        }
+        out.push(a.clone());
+        i += 1;
     }
     out
 }
 
-fn wait_for_paths(paths: &[PathBuf], timeout: Duration) -> Result<(), String> {
-    let started = Instant::now();
-    loop {
-        let missing: Vec<&PathBuf> = paths.iter().filter(|p| !p.exists()).collect();
-        if missing.is_empty() {
-            return Ok(());
-        }
-        if started.elapsed() > timeout {
-            return Err(format!(
-                "timeout waiting for {} extern path(s); first missing: {}",
-                missing.len(),
-                missing[0].display()
-            ));
-        }
-        thread::sleep(POLL_INTERVAL);
-    }
-}
-
-/// Compute the path rustc will write the `.rmeta` to. Cargo always passes
-/// `--out-dir` and a `-C extra-filename=-HASH` so the file is
-/// `<out_dir>/lib<crate_name><extra_filename>.rmeta` (for lib crates;
-/// bin crates use `<crate_name><extra_filename>` with no extension).
+/// Append a record to the queue file using the same format as
+/// `parallel-rustc-wrapper`:
+///   [ cwd, [[env_k, env_v], ...], rustc_path, rustc_arg, ... ]
 ///
-/// For our purposes any crate that emits metadata produces a .rmeta in this
-/// canonical location.
-fn expected_rmeta_path(args: &[String]) -> Option<PathBuf> {
-    let crate_name = find_value(args, "--crate-name")?;
-    let out_dir = find_value(args, "--out-dir")?;
-    let extra = find_extra_filename(args).unwrap_or_default();
-    // Build script `bin` crates would use no `lib` prefix, but we already
-    // passthrough those; everything reaching here is rmeta-emitting.
-    let crate_types: Vec<String> = collect_crate_types(args);
-    let is_lib = crate_types.iter().any(|t| {
-        t == "lib" || t == "rlib" || t == "dylib" || t == "proc-macro" || t == "cdylib" || t == "staticlib"
-    });
-    let file_name = if is_lib || crate_types.is_empty() {
-        format!("lib{crate_name}{extra}.rmeta")
-    } else {
-        // bin crates: rustc still writes a .rmeta when emit contains metadata,
-        // but uses no `lib` prefix.
-        format!("{crate_name}{extra}.rmeta")
-    };
-    Some(PathBuf::from(out_dir).join(file_name))
-}
+/// This lets the orchestrator reuse `recorder::parse_recorded` and
+/// `recorder::assign_phases`.
+fn enqueue(rustc: &OsString, rustc_args: &[String]) -> std::io::Result<()> {
+    let queue = env::var(QUEUE_ENV).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::Other, "PARALLEL_RUSTC_QUEUE not set")
+    })?;
 
-fn find_extra_filename(args: &[String]) -> Option<String> {
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        let val = if a == "-C" {
-            it.next().cloned()
-        } else if let Some(rest) = a.strip_prefix("-C") {
-            Some(rest.to_string())
-        } else {
-            None
-        };
-        if let Some(v) = val {
-            if let Some(rest) = v.strip_prefix("extra-filename=") {
-                return Some(rest.to_string());
-            }
+    let cwd = env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    // Capture whitelisted env vars plus DEP_* / CARGO_CFG_* / CARGO_FEATURE_*.
+    let mut envs: Vec<(String, String)> = Vec::new();
+    for key in CAPTURED_ENV {
+        if let Ok(v) = env::var(key) {
+            envs.push(((*key).to_string(), v));
         }
     }
-    None
-}
-
-fn collect_crate_types(args: &[String]) -> Vec<String> {
-    let mut types = Vec::new();
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        let val = if a == "--crate-type" {
-            it.next().cloned()
-        } else if let Some(rest) = a.strip_prefix("--crate-type=") {
-            Some(rest.to_string())
-        } else {
-            None
-        };
-        if let Some(v) = val {
-            for t in v.split(',') {
-                types.push(t.to_string());
-            }
+    for (k, v) in env::vars() {
+        if k.starts_with("DEP_")
+            || k.starts_with("CARGO_CFG_")
+            || k.starts_with("CARGO_FEATURE_")
+            || k.starts_with("CARGO_BIN_EXE_")
+        {
+            envs.push((k, v));
         }
     }
-    types
-}
 
-/// Append a JSON record to the queue file (flock-serialized).
-///
-/// Record fields:
-///   pid:      rustc PID still finishing in background (0 if already done)
-///   rmeta:    path to .rmeta we waited for (may be null)
-///   argv:     full rustc argv (for diagnostics / replay if PID dies)
-///   already_done: true if rustc fully exited before we got here
-fn enqueue(
-    pid: u32,
-    rmeta: &Option<PathBuf>,
-    rustc: &OsString,
-    rustc_args: &[String],
-    already_done: bool,
-) -> std::io::Result<()> {
-    let queue = match env::var(QUEUE_ENV) {
-        Ok(p) => p,
-        Err(_) => return Ok(()), // no queue — silently skip
-    };
+    // Build the JSON array: [cwd, [[k,v],...], rustc, arg, arg, ...]
+    let mut entry: Vec<serde_json::Value> = Vec::with_capacity(3 + rustc_args.len());
+    entry.push(serde_json::Value::String(cwd));
+    entry.push(serde_json::to_value(&envs).unwrap_or(serde_json::Value::Array(vec![])));
+    entry.push(serde_json::Value::String(
+        rustc.to_string_lossy().into_owned(),
+    ));
+    for a in rustc_args {
+        entry.push(serde_json::Value::String(a.clone()));
+    }
 
-    let mut argv: Vec<String> = Vec::with_capacity(1 + rustc_args.len());
-    argv.push(rustc.to_string_lossy().into_owned());
-    argv.extend(rustc_args.iter().cloned());
-
-    let record = serde_json::json!({
-        "pid": pid,
-        "rmeta": rmeta.as_ref().map(|p| p.to_string_lossy().into_owned()),
-        "already_done": already_done,
-        "crate_name": find_value(rustc_args, "--crate-name").unwrap_or_default(),
-        "argv": argv,
-    });
-    let line = serde_json::to_string(&record).map_err(|e| {
+    let line = serde_json::to_string(&entry).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::Other, format!("serialize: {e}"))
     })?;
 
@@ -379,9 +263,6 @@ extern "C" {
     #[link_name = "flock"]
     fn libc_flock(fd: i32, operation: i32) -> i32;
 }
-
-#[allow(dead_code)]
-fn _path_unused(_p: &Path) {}
 
 fn exec_passthrough(rustc: &OsString, rustc_args: &[OsString]) -> ! {
     let status = Command::new(rustc).args(rustc_args).status();
