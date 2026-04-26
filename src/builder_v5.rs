@@ -237,15 +237,18 @@ async fn run_codegen_dag(
         let mut seen: HashSet<usize> = HashSet::new();
         for ext_path in &u.externs {
             let p = Path::new(ext_path);
+            let fname_str = match p.file_name().map(|s| s.to_string_lossy().into_owned()) {
+                Some(f) => f, None => continue,
+            };
             let parent = p.parent()
                 .map(|pp| norm(&pp.to_string_lossy()))
                 .unwrap_or_default();
-            let fname = match p.file_name().map(|s| s.to_string_lossy().into_owned()) {
-                Some(f) => f, None => continue,
-            };
-            let cname = match extract_crate_name(&fname) {
+            let cname = match extract_crate_name(&fname_str) {
                 Some(c) => c, None => continue,
             };
+            // Only count deps that ARE in our queue (have a producer).
+            // Externs pointing to passthrough crates (not queued) are already
+            // compiled in the forward pass — treat them as satisfied.
             if let Some(prods) = producers.get(&(parent, cname)) {
                 for &p in prods {
                     if p != i && seen.insert(p) {
@@ -254,6 +257,7 @@ async fn run_codegen_dag(
                     }
                 }
             }
+            // else: extern points to a passthrough crate → already done, no dep edge
         }
     }
 
