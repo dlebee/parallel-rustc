@@ -116,23 +116,18 @@ pub fn classify_units(units: &[UnitGraphUnit]) -> ClassifiedUnits {
 }
 
 fn is_link_seed(u: &UnitGraphUnit) -> bool {
+    // Build scripts link their deps DURING the forward pass → full .rlib needed.
     if u.mode == "run-custom-build" {
         return true;
     }
     if u.mode == "build" {
-        // proc-macro dylibs are loaded at compile time → need full .rlib
+        // Proc-macros are dlopen()'d by rustc mid-pass → need full .so.
         if u.kind.iter().any(|k| k == "proc-macro") {
             return true;
         }
-        // Binary targets link their dependencies during cargo's forward pass.
-        // Their lib deps need full .rlib before the link step runs.
-        if u.kind.iter().any(|k| k == "bin") {
-            return true;
-        }
-        // cdylib / dylib / staticlib all link their dependencies too.
-        if u.kind.iter().any(|k| k == "cdylib" || k == "dylib" || k == "staticlib") {
-            return true;
-        }
+        // bins/cdylib/dylib/staticlib link at the END after all libs compile.
+        // NOT seeds — their lib deps only need .rmeta during the forward pass.
+        // Our codegen replay will produce .rlib before the final link step runs.
     }
     false
 }

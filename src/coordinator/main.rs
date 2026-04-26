@@ -74,8 +74,39 @@ fn main() {
     }
 
     let emit = find_value(&rustc_args_str, "--emit").unwrap_or_default();
-    if !emit.contains("metadata") {
+    let crate_type = find_value(&rustc_args_str, "--crate-type").unwrap_or_default();
+    let is_bin = crate_type == "bin" || crate_type.contains("bin");
+
+    if !emit.contains("metadata") && !is_bin {
+        // Not a lib (no metadata) and not a bin we want to defer → passthrough.
         exec_passthrough(rustc, &rustc_args);
+    }
+
+    if is_bin {
+        // Bin link step: defer entirely — just queue it for after codegen replay.
+        // Don't run rustc at all; produce a fake empty output so Cargo thinks
+        // it succeeded. Cargo will check for the binary in --out-dir.
+        // We'll run the real link after codegen replay when all .rlib are ready.
+        if let Err(e) = enqueue(rustc, &rustc_args_str) {
+            eprintln!("coordinator: enqueue (bin) failed: {e}");
+            // Fall back: actually run it (will fail if deps missing)
+            exec_passthrough(rustc, &rustc_args);
+        }
+        // Write a stub binary so Cargo's post-build checks pass.
+        if let Some(out_dir) = find_value(&rustc_args_str, "--out-dir") {
+            if let Some(name) = find_value(&rustc_args_str, "--crate-name") {
+                let stub = format!("{out_dir}/{name}");
+                let _ = std::fs::write(&stub, b"");
+                // Make it executable
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&stub,
+                        std::fs::Permissions::from_mode(0o755));
+                }
+            }
+        }
+        process::exit(0);
     }
 
     // Metadata-only pass (synchronous — Cargo waits for .rmeta).
@@ -167,18 +198,11 @@ fn enqueue(rustc: &OsString, rustc_args: &[String]) -> std::io::Result<()> {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    let mut envs: Vec<(String, String)> = Vec::new();
-    for key in CAPTURED_ENV {
-        if let Ok(v) = env::var(key) {
-            envs.push(((*key).to_string(), v));
-        }
-    }
-    for (k, v) in env::vars() {
-        if k.starts_with("DEP_") || k.starts_with("CARGO_CFG_")
-            || k.starts_with("CARGO_FEATURE_") || k.starts_with("CARGO_BIN_EXE_") {
-            envs.push((k, v));
-        }
-    }
+    // Capture ALL env vars — rustc/cargo rely on many env!() macros at
+    // compile time (CARGO_PKG_VERSION_MINOR, RUST_HOST_TARGET, etc.) that
+    // are set by Cargo for the specific invocation. Capturing everything
+    // ensures the codegen replay has the same env context as the forward pass.
+    let envs: Vec<(String, String)> = env::vars().collect();
 
     let mut argv: Vec<String> = Vec::with_capacity(1 + rustc_args.len());
     argv.push(rustc.to_string_lossy().into_owned());
