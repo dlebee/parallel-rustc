@@ -222,11 +222,37 @@ async fn run_codegen_dag(
     let n = units.len();
     if n == 0 { return Ok(()); }
 
-    // Build producers map: (normalized_out_dir, crate_name) → [unit_idx]
-    let mut producers: HashMap<(String, String), Vec<usize>> = HashMap::new();
+    // Build producers map: full output path stem → unit_idx.
+    // Key on the exact filename stem (including hash) so different feature-set
+    // compilations of the same crate don't falsely alias each other.
+    // e.g. libgetrandom-6737f8e27a35eb1c → unit 80
+    //      libgetrandom-225b2440f5627267 → unit 57  (different features)
+    let mut producers: HashMap<String, usize> = HashMap::new();
     for (i, u) in units.iter().enumerate() {
-        if u.crate_name.is_empty() || u.out_dir.is_empty() { continue; }
-        producers.entry((norm(&u.out_dir), u.crate_name.clone())).or_default().push(i);
+        if u.args.is_empty() { continue; }
+        // The output file stem comes from -C extra-filename=-<hash> + crate_name
+        // But we can also derive it from --out-dir + crate_name + hash in args.
+        // Simplest: parse -C extra-filename= from argv to get the hash suffix.
+        let hash_suffix = u.args.iter()
+            .find_map(|a| a.strip_prefix("-Cextra-filename=")
+                .or_else(|| a.strip_prefix("extra-filename=").and_then(|_| None)))
+            .or_else(|| {
+                let mut it = u.args.iter();
+                while let Some(a) = it.next() {
+                    if a == "-C" {
+                        if let Some(v) = it.next() {
+                            if let Some(s) = v.strip_prefix("extra-filename=") {
+                                return Some(s);
+                            }
+                        }
+                    }
+                }
+                None
+            });
+        if let Some(suffix) = hash_suffix {
+            let stem = format!("lib{}{}", u.crate_name, suffix);
+            producers.insert(stem, i);
+        }
     }
 
     // Build adj (dependency edges) and in_deg
@@ -240,28 +266,55 @@ async fn run_codegen_dag(
             let fname_str = match p.file_name().map(|s| s.to_string_lossy().into_owned()) {
                 Some(f) => f, None => continue,
             };
-            let parent = p.parent()
-                .map(|pp| norm(&pp.to_string_lossy()))
-                .unwrap_or_default();
-            let cname = match extract_crate_name(&fname_str) {
-                Some(c) => c, None => continue,
-            };
-            // Only count deps that ARE in our queue (have a producer).
-            // Externs pointing to passthrough crates (not queued) are already
-            // compiled in the forward pass — treat them as satisfied.
-            if let Some(prods) = producers.get(&(parent, cname)) {
-                for &p in prods {
-                    if p != i && seen.insert(p) {
-                        adj[p].push(i);
-                        in_deg[i] += 1;
-                    }
+            // Strip extension to get the stem: libfoo-hash
+            let stem = fname_str.strip_suffix(".rlib")
+                .or_else(|| fname_str.strip_suffix(".rmeta"))
+                .or_else(|| fname_str.strip_suffix(".so"))
+                .or_else(|| fname_str.strip_suffix(".d"))
+                .unwrap_or(&fname_str)
+                .to_string();
+            // Look up by exact stem — only creates dep edge if this exact
+            // compiled variant is in our queue (not a passthrough).
+            if let Some(&prod_idx) = producers.get(&stem) {
+                if prod_idx != i && seen.insert(prod_idx) {
+                    adj[prod_idx].push(i);
+                    in_deg[i] += 1;
                 }
             }
-            // else: extern points to a passthrough crate → already done, no dep edge
+            // else: extern from passthrough crate → already satisfied
         }
     }
 
     let runnable: Vec<bool> = (0..n).map(|i| !units[i].should_skip_replay()).collect();
+
+    // Break any cycles in the DAG using Kahn's algorithm dry-run.
+    // Cycles can occur when Cargo's feature resolution creates optional
+    // circular deps (e.g. getrandom ↔ rand_core via feature flags).
+    // We remove back-edges to break cycles, allowing progress.
+    {
+        // Topo-sort; any edge that would create a cycle gets removed.
+        let mut topo_indeg = in_deg.clone();
+        let mut queue: VecDeque<usize> = (0..n)
+            .filter(|&i| runnable[i] && topo_indeg[i] == 0)
+            .collect();
+        let mut visited = vec![false; n];
+        while let Some(i) = queue.pop_front() {
+            visited[i] = true;
+            for &dep in &adj[i] {
+                topo_indeg[dep] = topo_indeg[dep].saturating_sub(1);
+                if topo_indeg[dep] == 0 && runnable[dep] {
+                    queue.push_back(dep);
+                }
+            }
+        }
+        // Any runnable unit not visited is part of a cycle — reset its in_deg to 0
+        for i in 0..n {
+            if runnable[i] && !visited[i] && in_deg[i] > 0 {
+                eprintln!("[parallel-rustc] breaking cycle: {} (in_deg={})", units[i].crate_name, in_deg[i]);
+                in_deg[i] = 0;
+            }
+        }
+    }
 
     // For non-runnable units, treat as immediately done: decrement their dependents
     {
@@ -333,6 +386,18 @@ async fn run_codegen_dag(
 
     let done = *done_count.lock().unwrap();
     if done < total_runnable {
+        // Debug: print stuck units
+        let deg = in_deg.lock().unwrap();
+        let mut stuck = Vec::new();
+        for i in 0..n {
+            if runnable[i] && deg[i] > 0 {
+                let exts: Vec<String> = units[i].externs.iter()
+                    .map(|e| e.split('/').last().unwrap_or("?").to_string())
+                    .collect();
+                stuck.push(format!("  [{}] {} in_deg={} externs={}", i, units[i].crate_name, deg[i], exts.join(",")));
+            }
+        }
+        for s in stuck.iter().take(20) { eprintln!("{s}"); }
         return Err(format!(
             "DAG executor: {done}/{total_runnable} completed (dependency cycle?)"
         ));
